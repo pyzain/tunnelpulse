@@ -1,0 +1,30 @@
+# ── Build output ────────────────────────────────────────────────────────
+build/
+dist/
+*.spec
+version_info.txt
+*.zip
+
+# ── Python virtual environment ─────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Build logs (contain your local machine's file paths) ─────────────────
+TunnelPulse-BuildLog-*.txt
+
+# ── App runtime data (created on your own PC when you run the app) ───────
+*.log
+*.conf
+
+# ── Third-party WireGuard binaries — not this project's to redistribute ──
+# Install WireGuard for Windows yourself, or drop your own copy here to
+# bundle it into your build. See README for details.
+bin/
+
+# ── OS / editor junk ───────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
