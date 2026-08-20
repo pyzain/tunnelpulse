@@ -533,14 +533,12 @@ class TunnelPulseApp(ctk.CTk):
     def _on_close(self) -> None:
         self.connect_btn.configure(state="disabled")
         self.status_pill.set_state(core.ConnectionState.DISCONNECTING)
-
-        def shutdown_and_exit():
-            try:
-                self.engine.shutdown()
-            finally:
-                self.after(0, self.destroy)
-
-        threading.Thread(target=shutdown_and_exit, daemon=True).start()
+        # Route through the same thread-safe path as every other engine call
+        # in this file (_run_async -> _callback_queue -> drained on the main
+        # thread). Calling self.after() directly from the worker thread here
+        # would touch the Tk interpreter from a non-main thread -- exactly
+        # the bug this file's docstring says was eliminated everywhere.
+        self._run_async(self.engine.shutdown, on_done=lambda _result: self.destroy())
 
 
 # ---- ENTRY POINT  (PyInstaller target — self-healing top-level guard) ----
