@@ -15,7 +15,7 @@
 7. [How to Download This Project](#how-to-download-this-project)
 8. [Running It From Source](#running-it-from-source)
 9. [Building Your Own .exe](#building-your-own-exe)
-10. [Design Notes & Known Limitation](#design-notes--known-limitation)
+10. [Design Notes & Known Limitations](#design-notes--known-limitations)
 11. [License](#license)
 12. [Author](#author)
 
@@ -82,13 +82,16 @@ server — it just needs a `.conf` file pointing at one.
   the truth, not just a status light.
 - ✅ **Kill switch** — if the tunnel unexpectedly drops, your regular
   internet connection is blocked too, instead of silently falling back to
-  your normal, unprotected connection.
+  your normal, unprotected connection. TunnelPulse uses WireGuard's own
+  built-in kill switch, which switches on automatically for profiles that
+  send all traffic through the tunnel, and switches off the moment the
+  tunnel is removed — so it can never leave your PC stuck offline.
 - ✅ **DNS leak check** — confirms your DNS lookups (which translate
   website names into addresses) are actually going through the tunnel too.
-- ✅ **Adaptive link tuning** — automatically finds the best tunnel setting
-  for whatever network you're currently on (office Wi-Fi, home broadband,
-  tethered mobile data, etc.) so the VPN adds as little overhead as
-  possible.
+- ✅ **Adaptive link tuning** — one click measures your current network
+  (office Wi-Fi, home broadband, mobile data, etc.) and saves the best
+  tunnel packet size (MTU) to your profile, so the VPN adds as little
+  overhead as possible.
 - ✅ **Dark and light mode** — a single toggle, built so that switching
   themes can never leave a button the wrong color (a common bug in
   dashboard-style apps).
@@ -191,7 +194,7 @@ without a paid code-signing certificate, not a sign anything's wrong. Click
 
 ---
 
-## Design Notes & Known Limitation
+## Design Notes & Known Limitations
 
 A few deliberate choices worth knowing about:
 
@@ -202,11 +205,14 @@ A few deliberate choices worth knowing about:
 - **Reconnects are capped, not infinite.** If the tunnel keeps failing,
   TunnelPulse gives up after 8 attempts (with increasing delays between
   each) rather than retrying forever in the background.
-- **Known hardening TODO:** the kill switch's "allow" rule currently
-  permits traffic broadly rather than being scoped specifically to the
-  tunnel adapter. It's flagged directly in the code
-  (`KillSwitchManager.engage`) as something to tighten before any serious,
-  long-term deployment — noted here rather than quietly left undocumented.
+- **Kill switch only covers full-tunnel profiles.** WireGuard's built-in
+  kill switch applies when a profile routes *all* traffic (AllowedIPs
+  contains `0.0.0.0/0`). If you import a profile that only routes some
+  traffic, TunnelPulse tells you the kill switch is off rather than
+  pretending otherwise.
+- **"Optimize link" needs the server to answer ping.** Some servers block
+  ping; in that case TunnelPulse says it couldn't measure the link instead
+  of guessing a value.
 - **A VPN can't make your internet faster than your actual connection** —
   encryption and the extra hop always cost some overhead. TunnelPulse's
   "Optimize link" feature only minimizes that overhead for your current

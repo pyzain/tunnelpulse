@@ -1,29 +1,27 @@
-# ── Build output ────────────────────────────────────────────────────────
+# Build output
 build/
 dist/
 *.spec
 version_info.txt
 *.zip
 
-# ── Python virtual environment ─────────────────────────────────────────
+# Python environment and cache
 venv/
 __pycache__/
 *.pyc
 *.pyo
 
-# ── Build logs (contain your local machine's file paths) ─────────────────
+# Build logs (contain local file paths)
 TunnelPulse-BuildLog-*.txt
 
-# ── App runtime data (created on your own PC when you run the app) ───────
+# Runtime data and WireGuard configs (configs contain private keys)
 *.log
 *.conf
 
-# ── Third-party WireGuard binaries — not this project's to redistribute ──
-# Install WireGuard for Windows yourself, or drop your own copy here to
-# bundle it into your build. See README for details.
+# Official WireGuard binaries, bundled locally at build time only
 bin/
 
-# ── OS / editor junk ───────────────────────────────────────────────────
+# Editor / OS files
 .vscode/
 .idea/
 Thumbs.db

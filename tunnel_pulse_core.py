@@ -18,7 +18,7 @@ Design notes:
     the GUI polls on its own timer. The GUI must never block on this
     module, and this module must never touch GUI widgets.
   * Every public entry point validates before acting and verifies
-    after acting ("trust, then verify" — Python Brain Principle).
+    after acting.
 """
 
 from __future__ import annotations
@@ -66,6 +66,18 @@ def _local_appdata() -> Path:
 
 
 APP_DATA_DIR = _local_appdata()
+
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _run(args: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Run an external command without flashing a console window. The
+    compiled app is windowed, so every bare subprocess call would otherwise
+    pop up a black cmd window (several times a minute while connected)."""
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout,
+        creationflags=_CREATE_NO_WINDOW if IS_WINDOWS else 0,
+    )
 CONFIG_DIR = APP_DATA_DIR / "profiles"
 LOG_DIR = APP_DATA_DIR / "logs"
 
@@ -365,7 +377,8 @@ class PrivilegeManager:
             raise PrivilegeError("Elevation is only meaningful on Windows.")
         import sys
         try:
-            params = " ".join(f'"{a}"' for a in sys.argv[1:])
+            args = sys.argv[1:] if getattr(sys, "frozen", False) else [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+            params = " ".join(f'"{a}"' for a in args)
             ret = ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
                 None, "runas", sys.executable, params, None, 1
             )
@@ -447,11 +460,10 @@ class TunnelController:
                 "network adapter service). Elevate and try again."
             )
         exe = self.locator.require_wireguard()
+        # A service left behind by a crash would make the install fail.
+        _run([str(exe), "/uninstalltunnelservice", self._service_name(profile)], timeout=25)
         conf_path = self._conf_path(profile)
-        result = subprocess.run(
-            [str(exe), "/installtunnelservice", str(conf_path)],
-            capture_output=True, text=True, timeout=25,
-        )
+        result = _run([str(exe), "/installtunnelservice", str(conf_path)], timeout=25)
         if result.returncode != 0:
             raise TunnelStartError(
                 "The tunnel service failed to start.",
@@ -465,10 +477,7 @@ class TunnelController:
 
     def stop(self, profile: TunnelProfile) -> None:
         exe = self.locator.require_wireguard()
-        subprocess.run(
-            [str(exe), "/uninstalltunnelservice", self._service_name(profile)],
-            capture_output=True, text=True, timeout=25,
-        )
+        _run([str(exe), "/uninstalltunnelservice", self._service_name(profile)], timeout=25)
         conf = self._conf_path_only(profile)
         conf.unlink(missing_ok=True)
 
@@ -498,10 +507,7 @@ class TunnelController:
         if self.locator.wg_exe is None:
             return None
         try:
-            result = subprocess.run(
-                [str(self.locator.wg_exe), "show", self.adapter_name(profile), "latest-handshakes"],
-                capture_output=True, text=True, timeout=5,
-            )
+            result = _run([str(self.locator.wg_exe), "show", self.adapter_name(profile), "latest-handshakes"], timeout=5)
             parts = result.stdout.strip().split()
             if len(parts) >= 2:
                 handshake_epoch = int(parts[1])
@@ -513,55 +519,43 @@ class TunnelController:
         return None
 
 
-# ---- KILL SWITCH  (standard netsh advfirewall — transparent, Defender-friendly) ----
+# ---- KILL SWITCH ----
 
 class KillSwitchManager:
-    """Blocks all outbound traffic that doesn't go through the tunnel
-    adapter while connected, so a dropped tunnel can't silently fall back
-    to the raw connection. Uses documented netsh commands only — no raw
-    WFP hooks, nothing that reads as 'suspicious' to Defender."""
+    """WireGuard for Windows already enforces a kill switch through Windows
+    Filtering Platform rules whenever a tunnel has a single peer whose
+    AllowedIPs contains a /0 route (0.0.0.0/0 or ::/0). Those rules belong
+    to the tunnel service itself: they appear when it starts and vanish when
+    it is uninstalled, so a crash can never leave the PC without internet.
 
-    RULE_PREFIX = "TunnelPulse-KillSwitch"
+    This class checks that a profile qualifies for that behaviour rather than
+    adding Windows Firewall rules of its own. A blanket outbound block rule
+    cannot work here: in Windows Firewall, block rules override allow rules,
+    so it would also block the tunnel's own traffic."""
 
-    def __init__(self):
-        self._active_profile_id: Optional[str] = None
-
-    def engage(self, profile: TunnelProfile) -> None:
-        adapter = f"{TunnelController.SERVICE_PREFIX}-{profile.profile_id}"
-        rule_name = f"{self.RULE_PREFIX}-{profile.profile_id}"
-        self._run_netsh([
-            "advfirewall", "firewall", "add", "rule",
-            f"name={rule_name}", "dir=out", "action=block",
-            "enable=yes", "profile=any",
-        ])
-        self._run_netsh([
-            "advfirewall", "firewall", "add", "rule",
-            f"name={rule_name}-allow", "dir=out", "action=allow",
-            "enable=yes", "profile=any", f"interfacetype=any",
-        ])
-        # NOTE: a production build should scope the allow-rule to the
-        # tunnel adapter's interface index (resolved via `netsh interface
-        # show interface`) rather than a broad allow — tracked as a
-        # hardening TODO before real-world deployment.
-        self._active_profile_id = profile.profile_id
-        log.info("Kill switch engaged for profile %s", profile.profile_id)
-
-    def disengage(self, profile: TunnelProfile) -> None:
-        rule_name = f"{self.RULE_PREFIX}-{profile.profile_id}"
-        for suffix in ("", "-allow"):
-            self._run_netsh([
-                "advfirewall", "firewall", "delete", "rule",
-                f"name={rule_name}{suffix}",
-            ])
-        self._active_profile_id = None
-        log.info("Kill switch disengaged for profile %s", profile.profile_id)
+    LEGACY_RULE_PREFIX = "TunnelPulse-KillSwitch"   # rules written by v1.0.0
 
     @staticmethod
-    def _run_netsh(args: list[str]) -> None:
-        try:
-            subprocess.run(["netsh", *args], capture_output=True, text=True, timeout=10)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("netsh command failed (%s): %s", args, exc)
+    def qualifies(profile: TunnelProfile) -> bool:
+        return any(ip.strip().endswith("/0") for ip in profile.peer.allowed_ips)
+
+    def engage(self, profile: TunnelProfile) -> bool:
+        active = self.qualifies(profile)
+        if active:
+            log.info("Kill switch active (WireGuard full-tunnel mode) for %s", profile.profile_id)
+        else:
+            log.warning("Kill switch unavailable for %s: no /0 route in AllowedIPs", profile.profile_id)
+        return active
+
+    def disengage(self, profile: TunnelProfile) -> None:
+        # Nothing to undo for the current design; clear any rules an older
+        # build may have left behind.
+        rule = f"{self.LEGACY_RULE_PREFIX}-{profile.profile_id}"
+        for suffix in ("", "-allow"):
+            try:
+                _run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}{suffix}"], timeout=10)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("legacy rule cleanup skipped: %s", exc)
 
 
 # ---- BANDWIDTH MONITOR ----
@@ -615,9 +609,7 @@ class DNSLeakGuard:
         if not IS_WINDOWS:
             return []
         try:
-            result = subprocess.run(
-                ["ipconfig", "/all"], capture_output=True, text=True, timeout=5
-            )
+            result = _run(["ipconfig", "/all"], timeout=5)
             return re.findall(r"DNS Servers[.\s]*:\s*([\d.]+)", result.stdout)
         except Exception as exc:  # noqa: BLE001
             log.debug("DNS introspection failed: %s", exc)
@@ -644,31 +636,41 @@ class AdaptiveLinkOptimizer:
     the largest MTU that doesn't fragment, and suggesting it back to the
     engine for the next reconnect."""
 
+    IP_ICMP_HEADERS = 28      # IPv4 (20) + ICMP (8) around a ping payload
+    WIREGUARD_OVERHEAD = 80   # worst case (IPv6 outer header); 1500 - 80 = 1420 default
+    MIN_MTU, MAX_MTU = 1280, 1420
+
     def __init__(self, endpoint_host: str):
         self.endpoint_host = endpoint_host
 
-    def probe_optimal_mtu(self, low: int = 1200, high: int = 1420) -> int:
+    def probe_optimal_mtu(self, low: int = 1200, high: int = 1472) -> Optional[int]:
+        """Binary-search the largest unfragmented ping payload to the server,
+        then convert it to a tunnel MTU. Returns None if the server never
+        answered (it may block ping), rather than guessing."""
         if not IS_WINDOWS:
-            return high  # no reliable DF-ping story off Windows; keep default
-        best = low
+            return None
+        best: Optional[int] = None
         while low <= high:
             mid = (low + high) // 2
             if self._df_ping_succeeds(mid):
                 best = mid
-                low = mid + 8
+                low = mid + 1
             else:
-                high = mid - 8
-        return best
+                high = mid - 1
+        if best is None:
+            return None
+        path_mtu = best + self.IP_ICMP_HEADERS
+        return max(self.MIN_MTU, min(self.MAX_MTU, path_mtu - self.WIREGUARD_OVERHEAD))
 
     def _df_ping_succeeds(self, payload_size: int) -> bool:
         try:
-            result = subprocess.run(
-                ["ping", "-f", "-l", str(payload_size), "-n", "1", self.endpoint_host],
-                capture_output=True, text=True, timeout=5,
-            )
-            return "needed to be fragmented" not in result.stdout and result.returncode == 0
+            result = _run(["ping", "-f", "-l", str(payload_size), "-n", "1", "-w", "1500",
+                           self.endpoint_host], timeout=5)
         except Exception:  # noqa: BLE001
             return False
+        # Windows ping exits 0 even for "Destination host unreachable", so
+        # only a reply carrying a TTL counts as success.
+        return "TTL=" in result.stdout.upper() and "FRAGMENTED" not in result.stdout.upper()
 
 
 # ---- PUBLIC IP PROBE  (the only test that actually proves the VPN is working) ----
@@ -796,6 +798,7 @@ class TunnelPulseEngine:
     RECONNECT_BASE_DELAY = 2.0
     RECONNECT_MAX_DELAY = 60.0
     HEALTH_CHECK_INTERVAL = 5.0
+    MAX_RECONNECT_ATTEMPTS = 8
 
     def __init__(self):
         ensure_dirs()
@@ -840,14 +843,21 @@ class TunnelPulseEngine:
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._supervisor())
+        except RuntimeError:
+            pass  # shutdown() stops the loop mid-sleep; that is the normal exit path
         finally:
             self._loop.close()
 
     async def _supervisor(self) -> None:
         while not self._stop_flag.is_set():
-            if self.state == ConnectionState.CONNECTED and self.active_profile:
-                self._tick_health()
-                self._tick_bandwidth()
+            profile = self.active_profile
+            if profile:
+                if self.state == ConnectionState.RECONNECTING:
+                    self._self_heal_reconnect(profile)
+                elif self.state in (ConnectionState.CONNECTED, ConnectionState.DEGRADED):
+                    self._tick_health()
+                    if self.state in (ConnectionState.CONNECTED, ConnectionState.DEGRADED):
+                        self._tick_bandwidth()
             await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
 
     # ---- public API --------------------------------------------------
@@ -865,8 +875,6 @@ class TunnelPulseEngine:
         self._set_state(ConnectionState.CONNECTING)
         try:
             self.controller.start(profile)
-            if profile.kill_switch:
-                self.kill_switch.engage(profile)
         except TunnelPulseError:
             self._set_state(ConnectionState.FAILED)
             raise
@@ -875,9 +883,13 @@ class TunnelPulseEngine:
         if any(i.severity == "critical" for i in post_issues):
             self._set_state(ConnectionState.FAILED)
             self.controller.stop(profile)
-            if profile.kill_switch:
-                self.kill_switch.disengage(profile)
             raise TunnelStartError("Tunnel came up but failed verification.")
+
+        if profile.kill_switch and not self.kill_switch.engage(profile):
+            self.bus.publish(TunnelEvent(EventType.ISSUE_DETECTED, {"issue": Issue(
+                "warning",
+                "Kill switch is off: this profile only routes some traffic (no 0.0.0.0/0 in AllowedIPs).",
+            )}))
 
         self.active_profile = profile
         self._bandwidth = BandwidthMonitor(self.controller.adapter_name(profile))
@@ -940,6 +952,15 @@ class TunnelPulseEngine:
         optimizer = AdaptiveLinkOptimizer(self.active_profile.peer.endpoint_host)
         return optimizer.probe_optimal_mtu()
 
+    def save_mtu(self, mtu: int) -> TunnelProfile:
+        """Store a probed MTU in the active profile so the next connect uses it."""
+        if not self.active_profile:
+            raise ProfileError("Connect first, then optimize the link.")
+        updated = self.active_profile.model_copy(deep=True)
+        updated.interface.mtu = mtu
+        self.config_store.save(updated)
+        return updated
+
     # ---- internal ------------------------------------------------------
 
     def _set_state(self, new_state: ConnectionState) -> None:
@@ -993,15 +1014,28 @@ class TunnelPulseEngine:
         except TunnelPulseError:
             pass
         time.sleep(delay)
+        if self.active_profile is not profile:
+            return  # user disconnected while we were waiting
 
         try:
             self.controller.start(profile)
             self._set_state(ConnectionState.CONNECTED)
             self._reconnect_attempts = 0
+            self.bus.publish(TunnelEvent(EventType.ISSUE_RESOLVED, {"issue": Issue("info", "Tunnel restored.")}))
         except TunnelPulseError as exc:
             log.error("Reconnect failed: %s", exc.user_message)
-            if self._reconnect_attempts >= 8:
-                self._set_state(ConnectionState.FAILED)
+            if self._reconnect_attempts >= self.MAX_RECONNECT_ATTEMPTS:
+                try:
+                    self.controller.stop(profile)
+                except TunnelPulseError:
+                    pass
                 self.active_profile = None
+                self._bandwidth = None
+                self._reconnect_attempts = 0
+                self.bus.publish(TunnelEvent(EventType.ISSUE_DETECTED, {"issue": Issue(
+                    "critical",
+                    f"Gave up after {self.MAX_RECONNECT_ATTEMPTS} reconnect attempts. Check the server, then connect again.",
+                )}))
+                self._set_state(ConnectionState.FAILED)
             else:
                 self._set_state(ConnectionState.RECONNECTING)

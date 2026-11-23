@@ -1,47 +1,17 @@
 # ============================================================================
-# TunnelPulse Build Script
-# Run this via RUN_BUILD.bat (double-click it), not this .ps1 directly - the
-# .bat handles two Windows gotchas that otherwise make a build window vanish
-# instantly with zero information: PowerShell's execution policy silently
-# refusing to run an unsigned .ps1, and the console closing itself the
-# moment the script (or PowerShell itself) exits, good or bad.
+# TunnelPulse build script
+# Run it through RUN_BUILD.bat (double-click). The .bat bypasses PowerShell's
+# execution policy for this one script and keeps the window open at the end.
 #
-# Every run also writes a full transcript to TunnelPulse-BuildLog-<time>.txt
-# next to this script - that's the file to send along if something fails.
+# Every run writes a full transcript to TunnelPulse-BuildLog-<time>.txt.
 #
-# Retargeted from the DriverPulse build.ps1, with deliberate changes because
-# TunnelPulse's actual code is different in ways that matter for a VPN app:
-#
-#   1. --onedir instead of --onefile.
-#      A --onefile exe self-extracts to %TEMP% every time it runs. Combined
-#      with what this app actually does at runtime (installs a WireGuard
-#      network adapter service, rewrites firewall rules via netsh), that
-#      self-extract-then-touch-the-network pattern is exactly what AV
-#      heuristics flag hardest. --onedir ships a plain folder, no runtime
-#      unpacking step, far fewer false positives. It's zipped at the end
-#      into one file, so your client still just gets "one thing" to send.
-#
-#   2. NO --uac-admin manifest.
-#      DriverPulse always needed admin, so it force-elevated on launch.
-#      TunnelPulse's own code (see admin_badge in tunnel_pulse_gui.py) is
-#      built to run as a standard user and only need elevation when the
-#      user actually hits Connect. Baking in --uac-admin would UAC-prompt
-#      on every single launch, which contradicts that design. Leaving the
-#      manifest as default "asInvoker" instead.
-#
-#   3. Much shorter dependency list.
-#      No pywin32 / wmi / comtypes / pywinauto / Pillow / bs4 / lxml here -
-#      grepped both files, the only third-party imports are customtkinter,
-#      requests, psutil, and pydantic. Everything else in this app is
-#      stdlib (asyncio, ctypes, subprocess, tkinter, etc.).
-#
-# What this script deliberately does NOT do: add a Windows Defender
-# exclusion for the output. That's a real technique, but it's also the
-# first thing malware-distribution guides tell people to do - scripting it
-# here would be bad practice regardless of your app being legitimate. See
-# the notes printed at the end of a successful build for what actually
-# helps long-term (code signing) vs. what's expected either way (the first
-# -run SmartScreen "unknown publisher" prompt on an unsigned exe).
+# Build choices:
+#   --onedir      A plain folder with no self-extraction step at launch, which
+#                 antivirus heuristics flag far less than --onefile. The folder
+#                 is zipped at the end so it ships as a single file.
+#   no --uac-admin  The app runs as a standard user and asks for admin rights
+#                 only when Connect is pressed, so the exe must not force a UAC
+#                 prompt on every launch.
 # ============================================================================
 
 $APP_NAME   = "TunnelPulse"
@@ -56,7 +26,7 @@ $BUILD_DIR  = "build"
 $ICON_FILE  = "icon.ico"          # optional - used only if you drop one next to this script
 $BIN_DIR    = "bin"               # optional - put wireguard.exe/wg.exe/wintun.dll here to bundle them
 
-# ---- diagnostics: this is the "smoking gun" log file ----------------------
+# ---- build log ----
 $ErrorActionPreference = "Stop"   # any unexpected/uncaught error bubbles to the catch block below instead of the window just vanishing
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 Set-Location -Path $ScriptDir   # everything below uses relative paths (Test-Path $ENTRY, venv\, dist\, etc.) -
@@ -317,7 +287,7 @@ print(struct.calcsize("P") * 8)
         Log "  Found $BIN_DIR\ - bundling wireguard.exe/wg.exe/wintun.dll for zero-install runs" "Green"
         $dataArgs = @("--add-data", "$BIN_DIR;bin")
     } else {
-        Log "  No $BIN_DIR\ found - built app will rely on WireGuard for Windows being installed on the client's PC" "Yellow"
+        Log "  No $BIN_DIR\ found - built app will rely on WireGuard for Windows being installed on the target PC" "Yellow"
     }
 
     & $pyi `
@@ -372,8 +342,7 @@ print(struct.calcsize("P") * 8)
     Compress-Archive -Path "$appDir\*" -DestinationPath $zipName -Force
     Log "  Zipped: $zipName" "Green"
 
-    # Remove build clutter so the project folder stays clean for your client
-    # handoff - keep venv (for next rebuild), dist\ and the zip.
+    # Remove build clutter; keep venv (for the next rebuild), dist\ and the zip.
     Remove-Item -Recurse -Force $BUILD_DIR -ErrorAction SilentlyContinue
     Remove-Item -Force "$OUT_NAME.spec" -ErrorAction SilentlyContinue
     Remove-Item -Force "version_info.txt" -ErrorAction SilentlyContinue
@@ -384,17 +353,14 @@ print(struct.calcsize("P") * 8)
     Log "Zip (send this): $((Get-Item $zipName).FullName)" "Green"
     Log "" "White"
     Log "Deployment notes:" "Cyan"
-    Log " - Client's PC needs WireGuard for Windows installed, UNLESS you dropped" "Cyan"
+    Log " - The target PC needs WireGuard for Windows installed, unless you put" "Cyan"
     Log "   wireguard.exe/wg.exe/wintun.dll into a bin\ folder here before building." "Cyan"
     Log " - This exe is unsigned. Windows SmartScreen will show an 'unknown" "Cyan"
     Log "   publisher' warning on first run (Click 'More info' -> 'Run anyway')." "Cyan"
-    Log "   That's expected for any unsigned app and isn't a build error. The" "Cyan"
-    Log "   only real long-term fix is a code-signing certificate - not something" "Cyan"
-    Log "   a build script can work around, and scripting a Defender exclusion" "Cyan"
-    Log "   instead would be bad practice to hand to a client." "Cyan"
-    Log " - Connecting will prompt the client for admin rights the first time" "Cyan"
-    Log "   (installs a network adapter + firewall rules) - that's the app's" "Cyan"
-    Log "   own design, not something this script controls." "Cyan"
+    Log "   That's expected for any unsigned app; a code-signing certificate" "Cyan"
+    Log "   is the only real fix." "Cyan"
+    Log " - Pressing Connect asks for admin rights (it installs the WireGuard" "Cyan"
+    Log "   tunnel service). Launching the app itself does not." "Cyan"
 
     Start-Process explorer.exe -ArgumentList "/select,`"$((Get-Item $zipName).FullName)`""
 

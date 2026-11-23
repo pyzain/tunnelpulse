@@ -1,10 +1,5 @@
-# TunnelPulse — Python dependencies
-# Install with:  pip install -r requirements.txt
-
-customtkinter>=5.2.0    # GUI framework
-requests>=2.31.0        # public-IP checks (proves the tunnel is really working)
-psutil>=5.9.0           # live bandwidth + network adapter reading
-pydantic>=2.4.0         # validates VPN profiles before they're ever used
-
-# ── Needed only if you plan to compile your own .exe ──────────────────────
+customtkinter>=5.2.0
+requests>=2.31.0
+psutil>=5.9.0
+pydantic>=2.4.0
 pyinstaller>=6.3.0

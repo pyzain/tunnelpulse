@@ -5,7 +5,7 @@ Prepared by Zain Raza
 
 This is the ONLY file that touches widgets. All state, networking, and
 tunnel control lives in tunnel_pulse_core.py — this file reads from it
-and calls into it, never duplicates its logic (per project policy).
+and calls into it, and never duplicates its logic.
 
 Threading model:
   * The engine runs its own background thread (started inside
@@ -450,10 +450,19 @@ class TunnelPulseApp(ctk.CTk):
 
     def _after_optimize(self, result) -> None:
         if isinstance(result, Exception) or result is None:
-            self.issue_log.add("Link optimization could not determine an MTU.", "warning")
+            self.issue_log.add("Couldn't measure the link: the server didn't answer ping probes.", "warning")
             return
-        self.card_link.update_value(f"MTU {result}", "Suggested for current network")
-        self.issue_log.add(f"Optimal MTU probed: {result}. Reconnect to apply.")
+        try:
+            updated = self.engine.save_mtu(result)
+        except core.TunnelPulseError as exc:
+            self.issue_log.add(exc.user_message, "warning")
+            return
+        selected = self.profile_menu.get()
+        self._refresh_profile_list()
+        if selected in self._profiles_by_name:
+            self.profile_menu.set(selected)
+        self.card_link.update_value(f"MTU {result}", "Saved to profile")
+        self.issue_log.add(f"Optimal MTU {result} saved to '{updated.name}'. Reconnect to apply.")
 
     # ---- generic threaded call helper --------------------------------------
 
@@ -504,6 +513,11 @@ class TunnelPulseApp(ctk.CTk):
             self.status_pill.set_state(state)
             if state == core.ConnectionState.CONNECTED:
                 self._hide_banner()
+            elif (state in (core.ConnectionState.FAILED, core.ConnectionState.DISCONNECTED)
+                  and not self._busy and self.engine.active_profile is None
+                  and self._connect_start is not None):
+                # The engine ended the session on its own (gave up reconnecting).
+                self._after_disconnect(None)
         elif event.type == core.EventType.METRICS_TICK:
             sample: core.BandwidthSample = event.payload["sample"]
             self.card_download.update_value(f"{sample.down_mbps:.1f} Mbps")
