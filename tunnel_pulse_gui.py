@@ -17,14 +17,11 @@ Threading model:
     touched from a non-main thread.
 
 Theme model:
-  * Every color is defined ONCE as a (light, dark) tuple and handed to
-    CustomTkinter widgets directly — CTk resolves the right half of the
-    tuple automatically when the appearance mode changes. This is what
-    avoids the classic "toggled dark mode and three buttons stayed the
-    wrong color" bug: there is no second code path that re-colors
-    things by hand. The one exception is the plain Tk Canvas used for
-    the speed graph, which CTk doesn't theme automatically — that one
-    explicitly redraws itself on toggle (see Sparkline.apply_theme).
+  * Every color is a (light, dark) tuple passed straight to CustomTkinter,
+    which picks the right one when the appearance mode changes, so no code
+    re-colors widgets by hand on toggle. The speed graph is a plain Tk
+    Canvas that CTk doesn't theme, so it redraws itself on toggle
+    (see Sparkline.apply_theme).
 """
 
 from __future__ import annotations
@@ -43,7 +40,7 @@ import customtkinter as ctk
 
 import tunnel_pulse_core as core
 
-# ---- THEME  (single source of truth — see module docstring) ----
+# ---- THEME (all colors, see module docstring) ----
 
 class Theme:
     BG = ("#F4F5F8", "#0F1216")
@@ -154,7 +151,7 @@ class Sparkline(ctk.CTkCanvas):
 
 
 class IssueLog(ctk.CTkTextbox):
-    MAX_LINES = 200  # bounded — never let this become an unbounded memory leak
+    MAX_LINES = 200  # keep the log from growing forever
 
     def __init__(self, master):
         super().__init__(master, height=110, fg_color=Theme.SURFACE_ALT,
@@ -204,7 +201,7 @@ class TunnelPulseApp(ctk.CTk):
         self.after(self.POLL_INTERVAL_MS, self._poll_events)
         self.after(1000, self._tick_uptime)
 
-    # ---- UI construction --------------------------------------------------
+    # ---- UI construction ----
 
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -305,7 +302,7 @@ class TunnelPulseApp(ctk.CTk):
             text="Administrator" if core.PrivilegeManager.is_admin() else "Standard user — will prompt on connect"
         )
 
-    # ---- startup self-check (graceful degrade, not a crash) --------------
+    # ---- startup checks ----
 
     def _run_startup_check(self) -> None:
         issues = self.engine.locator
@@ -328,7 +325,7 @@ class TunnelPulseApp(ctk.CTk):
     def _hide_banner(self) -> None:
         self.setup_banner.pack_forget()
 
-    # ---- theme ------------------------------------------------------------
+    # ---- theme ----
 
     def _toggle_theme(self) -> None:
         mode = "Dark" if self.theme_switch.get() else "Light"
@@ -336,7 +333,7 @@ class TunnelPulseApp(ctk.CTk):
         self.sparkline.apply_theme()
         self.status_pill.set_state(self.engine.state)  # re-resolve dot color for new mode
 
-    # ---- profile handling ---------------------------------------------------
+    # ---- profile handling ----
 
     def _refresh_profile_list(self) -> None:
         profiles = self.engine.config_store.list_profiles()
@@ -366,7 +363,7 @@ class TunnelPulseApp(ctk.CTk):
         except OSError as exc:
             messagebox.showerror("Import failed", f"Couldn't read that file.\n{exc}")
 
-    # ---- connect / disconnect (always off the main thread) ----------------
+    # ---- connect / disconnect (always off the main thread) ----
 
     def _on_connect_clicked(self) -> None:
         if self._busy:
@@ -399,10 +396,8 @@ class TunnelPulseApp(ctk.CTk):
         messagebox.showerror("Connection failed", msg)
 
     def _offer_elevation(self) -> None:
-        """The one case connect() can fail on that the app can actually
-        fix itself: missing admin rights. Ask once, then relaunch the
-        whole process elevated rather than leaving the user stuck on a
-        dead-end error message with no path forward."""
+        """Missing admin rights is the one connect error the app can fix
+        itself: offer to relaunch elevated."""
         want_elevate = messagebox.askyesno(
             "Administrator rights needed",
             "Starting a tunnel installs a network adapter and firewall rules, "
@@ -464,21 +459,17 @@ class TunnelPulseApp(ctk.CTk):
         self.card_link.update_value(f"MTU {result}", "Saved to profile")
         self.issue_log.add(f"Optimal MTU {result} saved to '{updated.name}'. Reconnect to apply.")
 
-    # ---- generic threaded call helper --------------------------------------
+    # ---- generic threaded call helper ----
 
     def _run_async(self, fn: Callable, on_done: Callable[[object], None]) -> None:
-        """Runs fn() on a worker thread. Deliberately does NOT call any Tk
-        method (e.g. self.after) from that thread — Tkinter assumes only
-        the main thread ever touches the interpreter, and calling in from
-        elsewhere is a real, timing-dependent source of crashes, not just
-        a theoretical one. Results are handed off through a plain
-        thread-safe queue and picked up by the existing main-thread poll
-        loop (_poll_events), which already runs on a normal .after() timer."""
+        """Run fn() on a worker thread. Tkinter is not thread-safe, so the
+        worker never touches Tk (not even self.after); it puts the result
+        on a queue that _poll_events drains on the main thread."""
 
         def worker():
             try:
                 result = fn()
-            except Exception as exc:  # noqa: BLE001 - surfaced to caller, never crashes the thread silently
+            except Exception as exc:  # noqa: BLE001 - passed to on_done
                 result = exc
             self._callback_queue.put((on_done, result))
         threading.Thread(target=worker, daemon=True).start()
@@ -488,7 +479,7 @@ class TunnelPulseApp(ctk.CTk):
         self.connect_btn.configure(state="disabled" if busy else "normal",
                                     text=label if busy else self.connect_btn.cget("text"))
 
-    # ---- polling loops ------------------------------------------------------
+    # ---- polling loops ----
 
     def _poll_events(self) -> None:
         for event in self.engine.bus.drain():
@@ -504,7 +495,7 @@ class TunnelPulseApp(ctk.CTk):
                 break
             try:
                 on_done(result)
-            except Exception as exc:  # noqa: BLE001 - one bad callback must not kill the poll loop
+            except Exception as exc:  # noqa: BLE001 - keep polling
                 self.issue_log.add(f"Internal error: {exc}", "critical")
 
     def _handle_event(self, event: core.TunnelEvent) -> None:
@@ -542,32 +533,28 @@ class TunnelPulseApp(ctk.CTk):
 
         self.after(1000, self._tick_uptime)
 
-    # ---- shutdown -------------------------------------------------------------
+    # ---- shutdown ----
 
     def _on_close(self) -> None:
         self.connect_btn.configure(state="disabled")
         self.status_pill.set_state(core.ConnectionState.DISCONNECTING)
-        # Route through the same thread-safe path as every other engine call
-        # in this file (_run_async -> _callback_queue -> drained on the main
-        # thread). Calling self.after() directly from the worker thread here
-        # would touch the Tk interpreter from a non-main thread -- exactly
-        # the bug this file's docstring says was eliminated everywhere.
+        # Shut down on a worker thread, then destroy the window from the
+        # main thread via the callback queue (see _run_async).
         self._run_async(self.engine.shutdown, on_done=lambda _result: self.destroy())
 
 
-# ---- ENTRY POINT  (PyInstaller target — self-healing top-level guard) ----
+# ---- ENTRY POINT (PyInstaller target) ----
 
 def _install_global_exception_guard(app: TunnelPulseApp, log) -> None:
-    """A single unhandled exception in a callback must never take the
-    whole app down silently — log it, tell the user, keep the window
-    alive."""
+    """Log exceptions raised in Tk callbacks and show them in the activity
+    log, instead of losing them silently."""
 
     def handler(exc_type, exc_value, exc_tb):
         log.error("Unhandled GUI exception:\n%s", "".join(
             traceback.format_exception(exc_type, exc_value, exc_tb)))
         try:
             app.issue_log.add(f"Internal error: {exc_value}", "critical")
-        except Exception:  # noqa: BLE001 - the error handler itself must never raise
+        except Exception:  # noqa: BLE001
             pass
 
     app.report_callback_exception = handler
@@ -590,7 +577,7 @@ def main() -> int:
         log.critical("Fatal error during startup:\n%s", traceback.format_exc())
         try:
             messagebox.showerror("TunnelPulse", "TunnelPulse failed to start. See logs for details.")
-        except Exception:  # noqa: BLE001 - even the error dialog can fail headlessly
+        except Exception:  # noqa: BLE001
             pass
         return 1
 
@@ -604,7 +591,7 @@ def main() -> int:
     finally:
         try:
             app.engine.shutdown()
-        except Exception:  # noqa: BLE001 - best-effort cleanup on the way out
+        except Exception:  # noqa: BLE001
             pass
 
     return 0

@@ -49,7 +49,7 @@ import psutil
 import requests
 from pydantic import BaseModel, Field, field_validator
 
-# ---- CONSTANTS & PATHS  (self-healing: all paths resolved + created on demand) ----
+# ---- CONSTANTS & PATHS ----
 
 APP_NAME = "TunnelPulse"
 APP_AUTHOR = "Zain Raza"
@@ -58,8 +58,8 @@ IS_WINDOWS = platform.system() == "Windows"
 
 
 def _local_appdata() -> Path:
-    """Resolve %LOCALAPPDATA% with a sane fallback if the env var is missing
-    (self-healing: never trust an environment variable blindly)."""
+    """Resolve %LOCALAPPDATA%, falling back to the usual location if the
+    variable isn't set."""
     raw = os.environ.get("LOCALAPPDATA")
     base = Path(raw) if raw else Path.home() / "AppData" / "Local"
     return base / APP_NAME
@@ -92,8 +92,8 @@ def resource_dir() -> Path:
 
 
 def ensure_dirs() -> None:
-    """Self-healing: recreate the whole data directory tree if any part
-    of it is missing, corrupted, or was deleted mid-run."""
+    """Create the data folders if they don't exist. Called before every
+    write, so deleting them while the app runs doesn't break anything."""
     for d in (APP_DATA_DIR, CONFIG_DIR, LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -204,7 +204,7 @@ class EventBus:
         return events
 
 
-# ---- CONFIG MODELS  (pydantic — validated at the boundary, never trust input) ----
+# ---- CONFIG MODELS (validated with pydantic when loaded or imported) ----
 
 _WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$")
 
@@ -277,9 +277,8 @@ class TunnelProfile(BaseModel):
 
 
 class ConfigStore:
-    """Self-healing profile persistence. If the directory, an individual
-    file, or the JSON inside it is corrupt, this quarantines the bad file
-    and continues rather than crashing the app."""
+    """Saves and loads profiles as JSON. A corrupt profile file is moved
+    to a _corrupt/ subfolder instead of stopping the app from starting."""
 
     def __init__(self, directory: Path = CONFIG_DIR):
         self.directory = directory
@@ -291,7 +290,7 @@ class ConfigStore:
         for f in sorted(self.directory.glob("*.json")):
             try:
                 profiles.append(TunnelProfile.model_validate_json(f.read_text("utf-8")))
-            except Exception as exc:  # noqa: BLE001 - deliberately broad, self-heal path
+            except Exception as exc:  # noqa: BLE001 - any bad file should be skipped
                 log.warning("Quarantining corrupt profile %s: %s", f.name, exc)
                 corrupt_dir = self.directory / "_corrupt"
                 corrupt_dir.mkdir(exist_ok=True)
@@ -387,7 +386,7 @@ class PrivilegeManager:
             raise PrivilegeError("Could not request administrator rights.", str(exc)) from exc
 
 
-# ---- WIREGUARD BINARY LOCATOR  (self-healing search across common locations) ----
+# ---- WIREGUARD BINARY LOCATOR ----
 
 class WireGuardBinaryLocator:
     """Finds wireguard.exe (tunnel service manager) and the optional
@@ -431,7 +430,7 @@ class WireGuardBinaryLocator:
         return self.wireguard_exe
 
 
-# ---- TUNNEL CONTROLLER  (thin, careful wrapper around the official binaries) ----
+# ---- TUNNEL CONTROLLER (wraps the official wireguard.exe) ----
 
 class TunnelController:
     SERVICE_PREFIX = "TunnelPulse"
@@ -622,19 +621,17 @@ class DNSLeakGuard:
         rather than false-alarming the user)."""
         active = self.system_dns_servers()
         if not active:
-            return True  # unknown -> don't cry wolf
+            return True  # can't tell, so don't report a leak
         return any(d in expected_dns for d in active)
 
 
-# ---- ADAPTIVE LINK OPTIMIZER  ("tunnel down to the optimal level") ----
+# ---- ADAPTIVE LINK OPTIMIZER (MTU probing) ----
 
 class AdaptiveLinkOptimizer:
-    """A VPN can never exceed your raw connection speed — encryption and
-    an extra hop always cost some overhead. What this class *can* do is
-    keep that overhead as small as possible for the link you're actually
-    on right now (fibre, office wifi, tethered 5G, etc.) by probing for
-    the largest MTU that doesn't fragment, and suggesting it back to the
-    engine for the next reconnect."""
+    """Finds the largest tunnel MTU the current network can carry without
+    fragmenting. Too large an MTU causes fragmented or dropped packets; too
+    small wastes bandwidth on headers. The result is saved to the profile
+    and used on the next connect."""
 
     IP_ICMP_HEADERS = 28      # IPv4 (20) + ICMP (8) around a ping payload
     WIREGUARD_OVERHEAD = 80   # worst case (IPv6 outer header); 1500 - 80 = 1420 default
@@ -673,7 +670,7 @@ class AdaptiveLinkOptimizer:
         return "TTL=" in result.stdout.upper() and "FRAGMENTED" not in result.stdout.upper()
 
 
-# ---- PUBLIC IP PROBE  (the only test that actually proves the VPN is working) ----
+# ---- PUBLIC IP PROBE ----
 
 @dataclass
 class ProtectionStatus:
@@ -692,14 +689,12 @@ class ProtectionStatus:
 
 
 class PublicIPProbe:
-    """Fetches your current public-facing IP. This is the ground-truth
-    check: config files and adapter status can all look correct while
-    traffic is still leaking out your real connection. Comparing the
-    public IP before vs after connecting is the only way to *know*.
+    """Fetches the machine's public IP. The adapter can be up and the
+    config correct while traffic still goes out the normal connection, so
+    comparing the public IP before and after connecting is the check that
+    shows traffic really goes through the tunnel.
 
-    Self-healing: tries several independent providers in order and
-    returns None (not an exception) if all of them are unreachable —
-    a failed IP check should degrade the UI, never crash it.
+    Tries several providers in order and returns None if none respond.
     """
 
     PROVIDERS = [
@@ -726,7 +721,7 @@ class PublicIPProbe:
         return None
 
 
-# ---- SELF-HEALING DOCTOR  (pre-flight / post-flight validation) ----
+# ---- PRE/POST-CONNECT CHECKS ----
 
 @dataclass
 class Issue:
@@ -742,7 +737,7 @@ class SelfHealingDoctor:
     def preflight(self, profile: TunnelProfile) -> list[Issue]:
         issues: list[Issue] = []
 
-        ensure_dirs()  # silently self-heals missing directories
+        ensure_dirs()  # recreate data folders if missing
 
         if not IS_WINDOWS:
             issues.append(Issue("critical", "TunnelPulse's tunnel layer targets Windows only."))
@@ -788,7 +783,7 @@ class SelfHealingDoctor:
         return issues
 
 
-# ---- ENGINE  (facade + background supervisor loop) ----
+# ---- ENGINE ----
 
 class TunnelPulseEngine:
     """Public API surface the GUI talks to. Owns a background thread
@@ -822,7 +817,7 @@ class TunnelPulseEngine:
         self._stop_flag = threading.Event()
         self._reconnect_attempts = 0
 
-    # ---- lifecycle -------------------------------------------------
+    # ---- lifecycle ----
 
     def start_background_loop(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -860,7 +855,7 @@ class TunnelPulseEngine:
                         self._tick_bandwidth()
             await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
 
-    # ---- public API --------------------------------------------------
+    # ---- public API ----
 
     def connect(self, profile: TunnelProfile) -> None:
         self._set_state(ConnectionState.VALIDATING)
@@ -920,10 +915,8 @@ class TunnelPulseEngine:
         return self._bandwidth.history[-1] if self._bandwidth.history else None
 
     def verify_protection(self) -> ProtectionStatus:
-        """Ground-truth check: is traffic actually leaving through the
-        tunnel? Compares the public IP captured before connecting against
-        the public IP right now. Safe to call at any time, including
-        while disconnected (will just report protected=False)."""
+        """Compare the public IP captured before connecting with the current
+        one. Safe to call while disconnected (reports protected=False)."""
         current_ip = self.ip_probe.fetch()
         protected = bool(
             self.active_profile
@@ -961,7 +954,7 @@ class TunnelPulseEngine:
         self.config_store.save(updated)
         return updated
 
-    # ---- internal ------------------------------------------------------
+    # ---- internal ----
 
     def _set_state(self, new_state: ConnectionState) -> None:
         self.state = new_state

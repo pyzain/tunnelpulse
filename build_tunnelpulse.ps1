@@ -29,10 +29,7 @@ $BIN_DIR    = "bin"               # optional - put wireguard.exe/wg.exe/wintun.d
 # ---- build log ----
 $ErrorActionPreference = "Stop"   # any unexpected/uncaught error bubbles to the catch block below instead of the window just vanishing
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-Set-Location -Path $ScriptDir   # everything below uses relative paths (Test-Path $ENTRY, venv\, dist\, etc.) -
-                                 # this is what guarantees those resolve correctly no matter how the script
-                                 # was actually launched (double-clicked .bat, a shortcut with a different
-                                 # "Start in" folder, run from another terminal's cwd, etc.)
+Set-Location -Path $ScriptDir   # all paths below are relative to the script's folder
 $LogFile   = Join-Path $ScriptDir ("TunnelPulse-BuildLog-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")
 
 try {
@@ -56,14 +53,13 @@ $script:BuildFailed = $false
 
 try {
 
-    # -- Guard: Windows only --------------------------------------------------
-    # tunnel_pulse_core.py itself is Windows-only (ctypes.windll, netsh,
-    # wireguard.exe) - no point burning time on a build that can't run anyway.
+    # -- Guard: Windows only
+    # tunnel_pulse_core.py uses ctypes.windll, netsh and wireguard.exe.
     if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) {
         Fail "TunnelPulse is Windows-only (ctypes.windll, netsh, wireguard.exe). Build on Windows."
     }
 
-    # -- Guard: must not run inside an already-activated venv -----------------
+    # -- Guard: must not run inside an already-activated venv
     if ($env:VIRTUAL_ENV) {
         Log "Deactivating active venv before build..." "Yellow"
         & deactivate 2>$null
@@ -72,7 +68,7 @@ try {
     Log "=== $APP_NAME Build System ===" "Magenta"
     Log "Log file: $LogFile" "DarkGray"
 
-    # -- STEP 1: Confirm both source files are actually here -------------------
+    # -- STEP 1: Confirm both source files are actually here
     Log "[1/10] Checking source files..."
 
     if (-not (Test-Path $ENTRY)) {
@@ -83,7 +79,7 @@ try {
     }
     Log "  Found $ENTRY + $CORE_FILE" "Green"
 
-    # -- STEP 2: Find Python 3.11+ 64-bit ---------------------------------------
+    # -- STEP 2: Find Python 3.11+ 64-bit
     Log "[2/10] Finding Python..."
 
     try {
@@ -132,7 +128,7 @@ print(struct.calcsize("P") * 8)
 
     $VER_CODE = "import sys; print('ok') if sys.version_info >= (3, 11) else None"
 
-    # -- STEP 3: Virtual environment ---------------------------------------------
+    # -- STEP 3: Virtual environment
     Log "[3/10] Virtual environment..."
 
     $VENV_PY  = "$VENV_DIR\Scripts\python.exe"
@@ -157,7 +153,7 @@ print(struct.calcsize("P") * 8)
         }
     }
 
-    # -- STEP 4: Upgrade pip -------------------------------------------------------
+    # -- STEP 4: Upgrade pip
     Log "[4/10] Upgrading pip..."
     $pipUpOut = & $VENV_PY -m pip install --upgrade pip setuptools wheel --quiet 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -165,7 +161,7 @@ print(struct.calcsize("P") * 8)
         Log "  pip upgrade had warnings (non-fatal)" "Yellow"
     }
 
-    # -- STEP 5: Install packages --------------------------------------------------
+    # -- STEP 5: Install packages
     # Only 4 third-party imports exist across both files: customtkinter,
     # requests, psutil, pydantic. Everything else is stdlib.
     Log "[5/10] Installing packages..."
@@ -187,16 +183,15 @@ print(struct.calcsize("P") * 8)
         }
     }
 
-    # pydantic-specific self-heal: the core module uses v2-only API
-    # (field_validator, model_validate_json). If an old v1 happens to be
-    # resolved from somewhere, force the correct major version.
+    # The core module uses pydantic v2 APIs (field_validator,
+    # model_validate_json); upgrade if v1 got installed.
     $pydChk = & $VENV_PY -c "import pydantic; print('ok' if hasattr(pydantic, 'field_validator') else 'v1')" 2>$null
     if ($pydChk -ne "ok") {
         Log "  pydantic v1 (or broken) detected - forcing upgrade to v2..." "Yellow"
         & $VENV_PIP install --upgrade --force-reinstall "pydantic>=2.4.0" --quiet
     }
 
-    # -- STEP 6: Verify imports ----------------------------------------------------
+    # -- STEP 6: Verify imports
     Log "[6/10] Verifying imports..."
 
     $mods = @{
@@ -220,9 +215,7 @@ print(struct.calcsize("P") * 8)
         }
     }
 
-    # Sanity check that the entry file can actually import the core module the
-    # same way PyInstaller's analysis will see it (catches "forgot to run from
-    # the right folder" before burning time on a full PyInstaller pass).
+    # Make sure the core module imports before spending time on PyInstaller.
     $importChk = & $VENV_PY -c "import ast,sys; sys.path.insert(0,'.'); import tunnel_pulse_core" 2>&1
     if ($LASTEXITCODE -ne 0) {
         Log "  $importChk" "Red"
@@ -230,7 +223,7 @@ print(struct.calcsize("P") * 8)
     }
     Log "  tunnel_pulse_core.py imports cleanly" "Green"
 
-    # -- STEP 7: version_info.txt --------------------------------------------------
+    # -- STEP 7: version_info.txt
     Log "[7/10] Writing version_info.txt..."
 
     $p = $APP_VER.Split(".")
@@ -262,7 +255,7 @@ print(struct.calcsize("P") * 8)
     [System.IO.File]::WriteAllText("version_info.txt", $vi, [System.Text.Encoding]::UTF8)
     Log "  Written" "Green"
 
-    # -- STEP 8: Clean & build -----------------------------------------------------
+    # -- STEP 8: Clean & build
     Log "[8/10] Building (onedir, unsigned-friendly)..."
 
     foreach ($d in @($DIST_DIR, $BUILD_DIR)) {
@@ -317,7 +310,7 @@ print(struct.calcsize("P") * 8)
 
     if ($LASTEXITCODE -ne 0) { Fail "PyInstaller exited with code $LASTEXITCODE" }
 
-    # -- STEP 9: Verify output -----------------------------------------------------
+    # -- STEP 9: Verify output
     Log "[9/10] Verifying output..."
 
     $appDir = Join-Path $DIST_DIR $OUT_NAME
@@ -334,7 +327,7 @@ print(struct.calcsize("P") * 8)
         Log "  WARNING: PE header unexpected" "Yellow"
     }
 
-    # -- STEP 10: Zip for one-click handoff + cleanup clutter --------------------
+    # -- STEP 10: Zip the app folder and clean up
     Log "[10/10] Packaging + cleanup..."
 
     $zipName = "$OUT_NAME-v$APP_VER-win64.zip"
