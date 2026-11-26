@@ -62,6 +62,7 @@ function Find-InnoSetup {
     # dark wizard style (6.6+), or $null. $script:InnoSeen lists what was found,
     # for the error message.
     $candidates = @()
+    $regVersion = @{}
     if ($env:TUNNELPULSE_ISCC) { $candidates += $env:TUNNELPULSE_ISCC }
     # Where Windows says Inno Setup is installed (machine-wide or per-user).
     $uninstallKeys = @(
@@ -71,7 +72,11 @@ function Find-InnoSetup {
     )
     foreach ($k in $uninstallKeys) {
         Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($_.InstallLocation) { $candidates += (Join-Path $_.InstallLocation "ISCC.exe") }
+            if ($_.InstallLocation) {
+                $exe = Join-Path $_.InstallLocation "ISCC.exe"
+                $candidates += $exe
+                if ($_.DisplayVersion) { $regVersion[$exe.ToLower()] = $_.DisplayVersion }
+            }
         }
     }
     # Usual folders, for any major version.
@@ -88,17 +93,34 @@ function Find-InnoSetup {
 
     $script:InnoSeen = @()
     $best = $null
+    $unknown = $null
     foreach ($c in ($candidates | Select-Object -Unique)) {
         if (-not $c -or -not (Test-Path $c)) { continue }
+        # ISCC.exe itself carries no version number (it reads 0.0.0.0), so ask
+        # the compiler DLL next to it, then the version Windows recorded.
         $v = $null
-        try {
-            $info = (Get-Item $c).VersionInfo
-            if ($info.ProductVersion -match '^(\d+)\.(\d+)\.(\d+)') { $v = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" }
-            elseif ($info.FileMajorPart) { $v = [version]"$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)" }
-        } catch { }
-        $script:InnoSeen += "$c (version $v)"
-        if ($v -and $v -ge [version]"6.6.0" -and (-not $best -or $v -gt $best.Version)) { $best = @{ Path = $c; Version = $v } }
+        $sources = @($c, (Join-Path (Split-Path $c) "ISCmplr.dll"))
+        foreach ($f in $sources) {
+            if ($v -or -not (Test-Path $f)) { continue }
+            $info = (Get-Item $f).VersionInfo
+            foreach ($text in @($info.ProductVersion, $info.FileVersion)) {
+                if (-not $v -and $text -match '^(\d+)\.(\d+)\.(\d+)' -and [int]$Matches[1] -gt 0) {
+                    $v = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+                }
+            }
+        }
+        $r = $regVersion[$c.ToLower()]
+        if (-not $v -and $r -match '^(\d+)\.(\d+)\.(\d+)') { $v = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" }
+        $script:InnoSeen += "$c (version $(if ($v) { $v } else { 'unknown' }))"
+        if ($v) {
+            if ($v -ge [version]"6.6.0" -and (-not $best -or $v -gt $best.Version)) { $best = @{ Path = $c; Version = $v } }
+        } elseif (-not $unknown) {
+            $unknown = @{ Path = $c; Version = "unknown" }
+        }
     }
+    # A copy whose version can't be read is still tried: the installer script
+    # itself stops with a clear message if the compiler is older than 6.6.
+    if (-not $best) { $best = $unknown }
     return $best
 }
 
