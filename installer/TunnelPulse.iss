@@ -114,10 +114,14 @@ begin
   Result := '''' + Result + '''';
 end;
 
+{ Windows PowerShell started from PowerShell 7 inherits its module path and then
+  can't load its own built-in commands (Get-AuthenticodeSignature, Get-Service).
+  Putting its own module folder first avoids that. }
 function RunPowerShell(const Script: String; var ExitCode: Integer): Boolean;
 begin
   Result := Exec(PowerShellExe,
-    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Script + '"',
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+    '$env:PSModulePath = (Join-Path $PSHOME ''Modules'') + '';'' + $env:PSModulePath; ' + Script + '"',
     '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
 end;
 
@@ -176,12 +180,18 @@ var
 begin
   ReportFile := ExpandConstant('{tmp}\wireguard-signature.txt');
   Result := RunPowerShell(
-    '$s = Get-AuthenticodeSignature -LiteralPath ' + PsQuote(FileName) + '; ' +
-    '($s.Status.ToString() + '' | '' + $s.SignerCertificate.Subject) | Set-Content -Encoding ASCII -LiteralPath ' + PsQuote(ReportFile) + '; ' +
-    'if ($s.Status -eq ''Valid'' -and $s.SignerCertificate.Subject -like ''*WireGuard LLC*'') { exit 0 } else { exit 1 }',
+    '$ok = $false; ' +
+    'try { $s = Get-AuthenticodeSignature -LiteralPath ' + PsQuote(FileName) + ' -ErrorAction Stop; ' +
+    '$r = $s.Status.ToString() + '' | '' + $s.SignerCertificate.Subject; ' +
+    '$ok = ($s.Status -eq ''Valid'' -and $s.SignerCertificate.Subject -like ''*WireGuard LLC*'') } ' +
+    'catch { $r = ''error: '' + $_.Exception.Message }; ' +
+    'Set-Content -Encoding ASCII -LiteralPath ' + PsQuote(ReportFile) + ' -Value $r; ' +
+    'if ($ok) { exit 0 } else { exit 1 }',
     ExitCode) and (ExitCode = 0);
   if LoadStringFromFile(ReportFile, Report) then
-    Log('WireGuard MSI signature: ' + Trim(String(Report)));
+    Log('WireGuard MSI signature: ' + Trim(String(Report)))
+  else
+    Log('WireGuard MSI signature: no report (PowerShell exit code ' + IntToStr(ExitCode) + ')');
 end;
 
 function InstallWireGuard(var Reason: String): Boolean;
