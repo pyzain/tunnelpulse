@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Callable, Optional
@@ -96,14 +97,14 @@ class StatCard(ctk.CTkFrame):
         super().__init__(master, fg_color=Theme.SURFACE, corner_radius=14,
                           border_width=1, border_color=Theme.BORDER)
         self._title = ctk.CTkLabel(self, text=title.upper(), text_color=Theme.TEXT_SECONDARY,
-                                    font=ctk.CTkFont(size=11, weight="bold"))
-        self._title.pack(anchor="w", padx=16, pady=(14, 0))
+                                    font=ctk.CTkFont(size=11, weight="bold"), height=16)
+        self._title.pack(anchor="w", padx=16, pady=(10, 0))
         self._value = ctk.CTkLabel(self, text="\u2014", text_color=Theme.TEXT_PRIMARY,
-                                    font=ctk.CTkFont(size=22, weight="bold"))
+                                    font=ctk.CTkFont(size=22, weight="bold"), height=30)
         self._value.pack(anchor="w", padx=16, pady=(2, 0))
         self._subtitle = ctk.CTkLabel(self, text="", text_color=Theme.TEXT_SECONDARY,
-                                       font=ctk.CTkFont(size=12))
-        self._subtitle.pack(anchor="w", padx=16, pady=(0, 14))
+                                       font=ctk.CTkFont(size=12), height=18)
+        self._subtitle.pack(anchor="w", padx=16, pady=(0, 10))
 
     def update_value(self, value: str, subtitle: str = "", tone: tuple = None) -> None:
         self._value.configure(text=value, text_color=tone or Theme.TEXT_PRIMARY)
@@ -114,7 +115,7 @@ class Sparkline(ctk.CTkCanvas):
     """Plain Tk canvas — CustomTkinter doesn't theme these automatically,
     so it explicitly redraws itself whenever the app toggles theme."""
 
-    def __init__(self, master, height: int = 90):
+    def __init__(self, master, height: int = 70):
         super().__init__(master, height=height, highlightthickness=0,
                           bg=Theme.resolve(Theme.SURFACE))
         self._down: list[float] = []
@@ -176,13 +177,13 @@ class IssueLog(ctk.CTkTextbox):
 class TunnelPulseApp(ctk.CTk):
     POLL_INTERVAL_MS = 250
     PROTECTION_RECHECK_SECS = 60
+    LOG_MIN_HEIGHT = 90  # px (before display scaling) the activity log always keeps
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, check_updates: bool = True):
         super().__init__()
         self.debug = debug
         self.title("TunnelPulse")
-        self.geometry("620x640")
-        self.minsize(560, 600)
+        self.geometry("620x640")  # replaced by _size_to_screen once the widgets exist
         self.configure(fg_color=Theme.BG)
 
         self.engine = core.TunnelPulseEngine()
@@ -197,10 +198,56 @@ class TunnelPulseApp(ctk.CTk):
         self._refresh_profile_list()
         self._run_startup_check()
         self._apply_window_icon()
+        self._size_to_screen()
+        self.bind("<Configure>", self._on_resize, add="+")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if check_updates:
+            self.after(3000, self._check_for_update)
         self.after(self.POLL_INTERVAL_MS, self._poll_events)
         self.after(1000, self._tick_uptime)
+
+    # ---- window size ----
+    # Laptops often run Windows at 125-150% display scaling, which leaves less
+    # room than the 640 px the window used to open at. So the window opens
+    # tall enough for everything when the screen allows it, and on short
+    # screens the speed graph steps aside so the activity log stays readable.
+
+    def _scale(self) -> float:
+        return ctk.ScalingTracker.get_widget_scaling(self)
+
+    def _size_to_screen(self) -> None:
+        self.update_idletasks()
+        if not self._graph_frame.winfo_manager():  # measure with everything showing
+            self._graph_frame.pack(fill="x", padx=20, pady=8, before=self._actions_frame)
+            self.update_idletasks()
+        scale = ctk.ScalingTracker.get_window_scaling(self)
+        wanted = self.winfo_reqheight() / scale
+        room = self.winfo_screenheight() / scale - 90  # taskbar and title bar
+        height = int(max(min(wanted, room), 420))
+        self.minsize(560, min(600, height))
+        self.geometry(f"620x{height}")
+        self._sized = True
+
+    def _on_resize(self, event=None) -> None:
+        if event is not None and event.widget is not self:
+            return
+        self.after_idle(self._fit_layout)
+
+    def _fit_layout(self) -> None:
+        if not getattr(self, "_sized", False) or not self.winfo_exists() or self.winfo_height() <= 1:
+            return  # not on screen yet; the first <Configure> brings us back
+        scale = self._scale()
+        shown = self._graph_frame.winfo_manager() != ""
+        # everything except the log, as the window currently has it packed
+        fixed = self.winfo_reqheight() - self.issue_log.winfo_reqheight()
+        room_for_log = self.winfo_height() - fixed
+        graph_space = self._graph_frame.winfo_reqheight() + round(16 * scale)
+        if shown and room_for_log < self.LOG_MIN_HEIGHT * scale:
+            self._graph_frame.pack_forget()
+        elif not shown and room_for_log - graph_space >= (self.LOG_MIN_HEIGHT + 20) * scale:
+            self._graph_frame.pack(fill="x", padx=20, pady=8, before=self._actions_frame)
+            self.after_idle(self.sparkline.redraw)
 
     def _apply_window_icon(self) -> None:
         icon = core.resource_dir() / "assets" / "icon.ico"
@@ -293,14 +340,16 @@ class TunnelPulseApp(ctk.CTk):
         graph_frame = ctk.CTkFrame(self, fg_color=Theme.SURFACE, corner_radius=14,
                                     border_width=1, border_color=Theme.BORDER)
         graph_frame.pack(fill="x", padx=20, pady=8)
+        self._graph_frame = graph_frame
         ctk.CTkLabel(graph_frame, text="LIVE THROUGHPUT", text_color=Theme.TEXT_SECONDARY,
-                     font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=16, pady=(12, 0))
+                     font=ctk.CTkFont(size=11, weight="bold"), height=16).pack(anchor="w", padx=16, pady=(10, 0))
         self.sparkline = Sparkline(graph_frame)
-        self.sparkline.pack(fill="x", padx=16, pady=(4, 14))
+        self.sparkline.pack(fill="x", padx=16, pady=(4, 12))
 
         # -- actions row: verify / optimize --
         actions = ctk.CTkFrame(self, fg_color="transparent")
         actions.pack(fill="x", padx=20, pady=(0, 4))
+        self._actions_frame = actions
         ctk.CTkButton(actions, text="Verify protection now", fg_color=Theme.SURFACE_ALT,
                       text_color=Theme.TEXT_PRIMARY, hover_color=Theme.BORDER,
                       command=self._on_verify_clicked).pack(side="left")
@@ -308,20 +357,26 @@ class TunnelPulseApp(ctk.CTk):
                       text_color=Theme.TEXT_PRIMARY, hover_color=Theme.BORDER,
                       command=self._on_optimize_clicked).pack(side="left", padx=8)
 
-        # -- issue log --
-        ctk.CTkLabel(self, text="ACTIVITY", text_color=Theme.TEXT_SECONDARY,
-                     font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=24, pady=(10, 0))
-        self.issue_log = IssueLog(self)
-        self.issue_log.pack(fill="both", expand=True, padx=20, pady=(4, 8))
-
-        # -- footer --
+        # -- footer: packed before the log and pinned to the bottom, so a short
+        #    window squeezes the log instead of cutting it (and the footer) off --
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.pack(fill="x", padx=20, pady=(0, 14))
+        footer.pack(side="bottom", fill="x", padx=20, pady=(0, 14))
         self.admin_badge = ctk.CTkLabel(footer, text="", text_color=Theme.TEXT_SECONDARY,
                                          font=ctk.CTkFont(size=11))
         self.admin_badge.pack(side="left")
         ctk.CTkLabel(footer, text=f"Prepared by Zain Raza  \u00B7  v{core.APP_VERSION}",
                      text_color=Theme.TEXT_SECONDARY, font=ctk.CTkFont(size=11)).pack(side="right")
+        # shown only when GitHub has a newer release (see _check_for_update)
+        self.update_btn = ctk.CTkButton(footer, text="", height=22, width=0, corner_radius=11,
+                                         fg_color=Theme.ACCENT, text_color=Theme.ACCENT_TEXT,
+                                         font=ctk.CTkFont(size=11, weight="bold"),
+                                         command=self._on_update_clicked)
+
+        # -- issue log --
+        ctk.CTkLabel(self, text="ACTIVITY", text_color=Theme.TEXT_SECONDARY,
+                     font=ctk.CTkFont(size=11, weight="bold"), height=16).pack(anchor="w", padx=24, pady=(10, 0))
+        self.issue_log = IssueLog(self)
+        self.issue_log.pack(fill="both", expand=True, padx=20, pady=(4, 8))
 
         self.admin_badge.configure(
             text="Administrator" if core.PrivilegeManager.is_admin() else "Standard user — will prompt on connect"
@@ -359,9 +414,11 @@ class TunnelPulseApp(ctk.CTk):
     def _show_banner(self, text: str, color: tuple) -> None:
         self.setup_banner.configure(text=text, text_color=color)
         self.setup_banner.pack(fill="x", padx=20, pady=(0, 8), after=self._controls_frame)
+        self.after_idle(self._fit_layout)
 
     def _hide_banner(self) -> None:
         self.setup_banner.pack_forget()
+        self.after_idle(self._fit_layout)
 
     # ---- theme ----
 
@@ -507,6 +564,29 @@ class TunnelPulseApp(ctk.CTk):
             self.profile_menu.set(selected)
         self.card_link.update_value(f"MTU {result}", "Saved to profile")
         self.issue_log.add(f"Optimal MTU {result} saved to '{updated.name}'. Reconnect to apply.")
+
+    # ---- updates ----
+
+    def _check_for_update(self) -> None:
+        self._run_async(core.UpdateChecker().newer_version, self._on_update_result)
+
+    def _on_update_result(self, version) -> None:
+        if not isinstance(version, str):
+            return
+        self._new_version = version
+        self.update_btn.configure(text=f"  Update to v{version}  ")
+        self.update_btn.pack(side="right", padx=(0, 10))
+        self.issue_log.add(f"TunnelPulse v{version} is available. Click \u2018Update\u2019 at the bottom right to get it.")
+
+    def _on_update_clicked(self) -> None:
+        if not messagebox.askyesno(
+            "Update TunnelPulse",
+            f"Download TunnelPulse v{self._new_version} now?\n\n"
+            "When it finishes, run TunnelPulse-Setup. It installs over this version and "
+            "keeps your profiles, so there's no need to uninstall first.",
+        ):
+            return
+        webbrowser.open(core.UpdateChecker.DOWNLOAD_URL)
 
     # ---- generic threaded call helper ----
 

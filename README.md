@@ -82,8 +82,11 @@ you set up once. There are two options:
 1. **Host it yourself.** Rent a small cloud server (a "VPS") and install
    WireGuard on it. Some providers, such as Oracle Cloud, have a free tier
    that's enough. At the end you get a `.conf` file to import into TunnelPulse.
-2. **Use a WireGuard-compatible VPN provider.** Some paid providers (Mullvad,
-   for example) give you a ready-made `.conf` file, with no server setup.
+2. **Use a WireGuard-compatible VPN provider.** Many providers give you a
+   ready-made `.conf` file, with no server setup. Proton VPN does this on its
+   free plan too: sign in at account.protonvpn.com, open **Downloads →
+   WireGuard configuration**, create one and download it. That's the quickest
+   way to try TunnelPulse.
 
 TunnelPulse doesn't include, host or charge for a server. It just needs a
 `.conf` file that points at one.
@@ -129,6 +132,14 @@ actually work. TunnelPulse was built with two goals:
 - ✅ **Live dashboard:** download and upload speed, data used this session,
   connection time, and a live speed graph.
 
+## Updating
+
+When a new version is out, TunnelPulse shows an **Update** button at the bottom
+right of the window. Click it, then run the `TunnelPulse-Setup.exe` that
+downloads. It installs over your current version and keeps your profiles, so
+there's no need to uninstall first. (Downloading the setup from this page and
+running it does exactly the same.)
+
 ## Uninstalling
 
 Open **Settings → Apps**, find **TunnelPulse**, and click **Uninstall**.
@@ -151,6 +162,8 @@ you no longer need it.
   runs it after Windows confirms it's signed by WireGuard LLC.
 - The app only asks for administrator rights when you connect, not every time
   it opens.
+- Each time it opens, the app asks GitHub once whether there's a newer version.
+  Nothing about you or your connection is sent.
 
 ---
 

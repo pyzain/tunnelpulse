@@ -4,6 +4,8 @@
 2. Open it. Windows may say *"Windows protected your PC"*: click **More info**, then **Run anyway**. (The app isn't code-signed yet, so Windows doesn't recognise the publisher.)
 3. Click **Yes** when Windows asks to allow changes, then **Install**.
 
+**Already have TunnelPulse?** Just run the new setup. It installs over the old version and keeps your profiles, no need to uninstall first.
+
 Setup also downloads and installs **WireGuard** from wireguard.com if it isn't on your PC yet, after checking it's genuinely signed by WireGuard LLC.
 
 You'll need a WireGuard `.conf` file from your VPN server or provider to connect. See the [README](https://github.com/pyzain/tunnelpulse#readme).

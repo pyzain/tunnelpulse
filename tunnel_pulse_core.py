@@ -52,7 +52,7 @@ from pydantic import BaseModel, Field, field_validator
 # ---- CONSTANTS & PATHS ----
 
 APP_NAME = "TunnelPulse"
-APP_VERSION = "1.0.0"   # single source of truth: the build script and installer read it from here
+APP_VERSION = "1.0.1"   # single source of truth: the build script and installer read it from here
 APP_AUTHOR = "Zain Raza"
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -712,6 +712,38 @@ class ProtectionStatus:
         if self.baseline_ip is None:
             return "No baseline captured"
         return "Protected" if self.protected else "Not protected — same IP as before"
+
+
+class UpdateChecker:
+    """Asks GitHub for the newest TunnelPulse release. Installing it is just
+    running the new setup over the old one: same install folder, profiles
+    kept. One request per start-up; any failure (offline, rate limit,
+    blocked) just means no update notice."""
+
+    LATEST_RELEASE_API = "https://api.github.com/repos/pyzain/tunnelpulse/releases/latest"
+    DOWNLOAD_URL = "https://github.com/pyzain/tunnelpulse/releases/latest/download/TunnelPulse-Setup.exe"
+
+    @staticmethod
+    def parse_version(text: str) -> Optional[tuple[int, int, int]]:
+        m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+    def newer_version(self, timeout: float = 5.0) -> Optional[str]:
+        """The newer version number (e.g. "1.0.1"), or None if this one is current."""
+        try:
+            resp = requests.get(self.LATEST_RELEASE_API, timeout=timeout, headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            })
+            resp.raise_for_status()
+            tag = resp.json().get("tag_name", "")
+        except Exception as exc:  # noqa: BLE001 - an update check must never get in the way
+            log.debug("update check failed: %s", exc)
+            return None
+        latest, current = self.parse_version(tag), self.parse_version(APP_VERSION)
+        if latest and current and latest > current:
+            return "%d.%d.%d" % latest
+        return None
 
 
 class PublicIPProbe:

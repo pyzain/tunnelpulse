@@ -210,3 +210,39 @@ def test_dns_check_skipped_without_dns_servers(monkeypatch):
     monkeypatch.setattr(core.DNSLeakGuard, "system_dns_servers", staticmethod(lambda: ["192.168.1.1"]))
     assert core.DNSLeakGuard().check([]) is True
     assert core.DNSLeakGuard().check(["10.64.0.1"]) is False
+
+
+# ---- update check ----
+
+class FakeResponse:
+    def __init__(self, tag):
+        self._tag = tag
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"tag_name": self._tag}
+
+
+@pytest.mark.parametrize("tag, expected", [
+    ("v9.0.0", "9.0.0"),
+    (f"v{core.APP_VERSION}", None),   # same version: nothing to do
+    ("v0.0.1", None),                 # older release: never "update" backwards
+    ("nightly", None),                # tag that isn't a version
+])
+def test_update_check(monkeypatch, tag, expected):
+    monkeypatch.setattr(core.requests, "get", lambda *a, **k: FakeResponse(tag))
+    assert core.UpdateChecker().newer_version() == expected
+
+
+def test_update_check_offline(monkeypatch):
+    def offline(*a, **k):
+        raise core.requests.ConnectionError("no network")
+    monkeypatch.setattr(core.requests, "get", offline)
+    assert core.UpdateChecker().newer_version() is None
+
+
+def test_version_compare_is_numeric():
+    parse = core.UpdateChecker.parse_version
+    assert parse("v1.10.0") > parse("1.9.9")
