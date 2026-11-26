@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field, field_validator
 # ---- CONSTANTS & PATHS ----
 
 APP_NAME = "TunnelPulse"
+APP_VERSION = "1.0.0"   # single source of truth: the build script and installer read it from here
 APP_AUTHOR = "Zain Raza"
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -231,7 +232,7 @@ class PeerConfig(BaseModel):
 
 class InterfaceConfig(BaseModel):
     private_key: str
-    address: list[str]                # e.g. ["10.66.0.2/32"]
+    address: list[str] = Field(min_length=1)   # e.g. ["10.66.0.2/32"]
     dns: list[str] = Field(default_factory=lambda: ["1.1.1.1", "9.9.9.9"])
     mtu: int = Field(default=1420, ge=576, le=1500)
 
@@ -260,7 +261,10 @@ class TunnelProfile(BaseModel):
             "[Interface]",
             f"PrivateKey = {i.private_key}",
             f"Address = {', '.join(i.address)}",
-            f"DNS = {', '.join(i.dns)}",
+        ]
+        if i.dns:
+            lines.append(f"DNS = {', '.join(i.dns)}")
+        lines += [
             f"MTU = {i.mtu}",
             "",
             "[Peer]",
@@ -316,6 +320,7 @@ class ConfigStore:
         control, or given to you by a WireGuard-compatible provider)."""
         section = None
         kv: dict[str, dict[str, str]] = {"Interface": {}, "Peer": {}}
+        conf_text = conf_text.lstrip("\ufeff")  # byte-order mark from Notepad
         for raw_line in conf_text.splitlines():
             line = raw_line.split("#", 1)[0].strip()
             if not line:
@@ -368,15 +373,20 @@ class PrivilegeManager:
             return False
 
     @staticmethod
-    def relaunch_as_admin() -> bool:
-        """Re-launches the current executable elevated via UAC and exits
-        this process. Only ever called right before an action that truly
-        needs it (tunnel install, firewall rules) — never at startup."""
+    def relaunch_as_admin(extra_args: Optional[list[str]] = None) -> bool:
+        """Re-launch the app elevated via UAC. Only called right before an
+        action that needs it (installing the tunnel service), never at
+        startup. extra_args are appended, e.g. ["--connect", profile_id]."""
         if not IS_WINDOWS:
             raise PrivilegeError("Elevation is only meaningful on Windows.")
         import sys
         try:
-            args = sys.argv[1:] if getattr(sys, "frozen", False) else [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+            own_args = [a for a in sys.argv[1:]]
+            if "--connect" in own_args:  # don't stack a previous --connect request
+                i = own_args.index("--connect")
+                del own_args[i:i + 2]
+            own_args += extra_args or []
+            args = own_args if getattr(sys, "frozen", False) else [os.path.abspath(sys.argv[0]), *own_args]
             params = " ".join(f'"{a}"' for a in args)
             ret = ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
                 None, "runas", sys.executable, params, None, 1
@@ -473,6 +483,14 @@ class TunnelController:
                 "WireGuard reported success but no network adapter appeared.",
                 "adapter not found in psutil.net_if_addrs() within timeout",
             )
+        # WireGuard creates tunnel services that start automatically at boot.
+        # TunnelPulse only monitors a tunnel while it's open, so make it start
+        # on demand instead: otherwise, after a restart, a full-tunnel profile
+        # with an unreachable server would block all traffic with nothing
+        # telling the user why.
+        sc = _run(["sc.exe", "config", f"WireGuardTunnel${self._service_name(profile)}", "start=", "demand"], timeout=15)
+        if sc.returncode != 0:
+            log.warning("Couldn't set the tunnel service to manual start: %s", sc.stdout.strip() or sc.stderr.strip())
 
     def stop(self, profile: TunnelProfile) -> None:
         exe = self.locator.require_wireguard()
@@ -494,6 +512,12 @@ class TunnelController:
 
     def adapter_name(self, profile: TunnelProfile) -> str:
         return self._service_name(profile)
+
+    def running_tunnel_ids(self) -> list[str]:
+        """Profile ids of TunnelPulse tunnels that are up right now, e.g. one
+        left running after the app crashed. Doesn't need admin rights."""
+        prefix = f"{self.SERVICE_PREFIX}-"
+        return [name[len(prefix):] for name in psutil.net_if_addrs() if name.startswith(prefix)]
 
     def is_adapter_up(self, profile: TunnelProfile) -> bool:
         stats = psutil.net_if_stats().get(self.adapter_name(profile))
@@ -532,7 +556,7 @@ class KillSwitchManager:
     cannot work here: in Windows Firewall, block rules override allow rules,
     so it would also block the tunnel's own traffic."""
 
-    LEGACY_RULE_PREFIX = "TunnelPulse-KillSwitch"   # rules written by v1.0.0
+    LEGACY_RULE_PREFIX = "TunnelPulse-KillSwitch"   # rules written by early development builds
 
     @staticmethod
     def qualifies(profile: TunnelProfile) -> bool:
@@ -619,6 +643,8 @@ class DNSLeakGuard:
         tunnel profile's expected DNS (best-effort — ipconfig output
         varies across Windows builds, so this fails open to 'unknown'
         rather than false-alarming the user)."""
+        if not expected_dns:
+            return True  # profile sets no DNS servers, so there is nothing to compare
         active = self.system_dns_servers()
         if not active:
             return True  # can't tell, so don't report a leak
@@ -794,6 +820,7 @@ class TunnelPulseEngine:
     RECONNECT_MAX_DELAY = 60.0
     HEALTH_CHECK_INTERVAL = 5.0
     MAX_RECONNECT_ATTEMPTS = 8
+    NO_HANDSHAKE_GRACE = 30.0   # seconds after connecting before "server isn't answering" is reported
 
     def __init__(self):
         ensure_dirs()
@@ -816,6 +843,8 @@ class TunnelPulseEngine:
         self._thread: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
         self._reconnect_attempts = 0
+        self._connected_at = 0.0
+        self._degraded_reasons: set[str] = set()
 
     # ---- lifecycle ----
 
@@ -889,6 +918,8 @@ class TunnelPulseEngine:
         self.active_profile = profile
         self._bandwidth = BandwidthMonitor(self.controller.adapter_name(profile))
         self._reconnect_attempts = 0
+        self._connected_at = time.time()
+        self._degraded_reasons = set()
         self.start_background_loop()
         self._set_state(ConnectionState.CONNECTED)
         threading.Thread(target=self.verify_protection, daemon=True).start()  # non-blocking
@@ -975,23 +1006,35 @@ class TunnelPulseEngine:
 
         adapter_ok = self.controller.is_adapter_up(profile)
         handshake_age = self.controller.last_handshake_age(profile)
-        dns_ok = self._dns_guard.check(profile.interface.dns)
 
         unhealthy = (not adapter_ok) or (handshake_age is not None and handshake_age > 180)
-
-        if not dns_ok:
-            self._set_state(ConnectionState.DEGRADED)
-            self.bus.publish(TunnelEvent(
-                EventType.ISSUE_DETECTED,
-                {"issue": Issue("warning", "Possible DNS leak detected — traffic may bypass the tunnel's DNS.")},
-            ))
-        elif self.state == ConnectionState.DEGRADED:
-            self._set_state(ConnectionState.CONNECTED)
-
         if unhealthy:
             log.warning("Health check failed (adapter_ok=%s handshake_age=%s) — self-healing reconnect.",
                         adapter_ok, handshake_age)
             self._self_heal_reconnect(profile)
+            return
+
+        # Problems that a reconnect can't fix: report them and mark the
+        # session as degraded, but keep the tunnel up.
+        problems: set[str] = set()
+        if not self._dns_guard.check(profile.interface.dns):
+            problems.add("Possible DNS leak detected — traffic may bypass the tunnel's DNS.")
+        never_answered = (
+            self.controller.locator.wg_exe is not None
+            and handshake_age is None
+            and time.time() - self._connected_at > self.NO_HANDSHAKE_GRACE
+        )
+        if never_answered:
+            problems.add("The server hasn't answered yet. Check the server address, port and keys in the .conf file.")
+
+        for text in sorted(problems - self._degraded_reasons):
+            self.bus.publish(TunnelEvent(EventType.ISSUE_DETECTED, {"issue": Issue("warning", text)}))
+        if problems:
+            self._set_state(ConnectionState.DEGRADED)
+        elif self.state == ConnectionState.DEGRADED:
+            self._set_state(ConnectionState.CONNECTED)
+            self.bus.publish(TunnelEvent(EventType.ISSUE_RESOLVED, {"issue": Issue("info", "Connection healthy again.")}))
+        self._degraded_reasons = problems
 
     def _self_heal_reconnect(self, profile: TunnelProfile) -> None:
         self._set_state(ConnectionState.RECONNECTING)
@@ -1014,6 +1057,8 @@ class TunnelPulseEngine:
             self.controller.start(profile)
             self._set_state(ConnectionState.CONNECTED)
             self._reconnect_attempts = 0
+            self._connected_at = time.time()
+            self._degraded_reasons = set()
             self.bus.publish(TunnelEvent(EventType.ISSUE_RESOLVED, {"issue": Issue("info", "Tunnel restored.")}))
         except TunnelPulseError as exc:
             log.error("Reconnect failed: %s", exc.user_message)

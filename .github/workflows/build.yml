@@ -1,0 +1,182 @@
+name: Build and test
+
+# Every push to main and every pull request: build the app and the installer on
+# a clean Windows machine, then install, run, connect and uninstall it for real.
+# A tag like v1.0.0 additionally publishes a GitHub Release with the installer.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows build, install and tunnel test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write   # only used by the release step, which runs for tags
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check that the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $v = (Select-String tunnel_pulse_core.py -Pattern '^APP_VERSION\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne $env:GITHUB_REF_NAME) {
+            Write-Host "::error::Tag $env:GITHUB_REF_NAME doesn't match APP_VERSION $v in tunnel_pulse_core.py"
+            exit 1
+          }
+
+      - name: Install Inno Setup
+        run: |
+          choco upgrade innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=Inno Setup::choco upgrade innosetup failed ($LASTEXITCODE)"; exit 1 }
+
+      - name: Build app, portable zip and installer
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_tunnelpulse.ps1 -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist -File | Format-Table Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
+
+      - name: Unit tests
+        run: |
+          venv\Scripts\python.exe -m pip install --quiet pytest
+          $out = venv\Scripts\python.exe -m pytest tests -q -rfE 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $out
+          if ($code -ne 0) {
+            $out | Where-Object { $_ -match '^(FAILED|ERROR)' } | ForEach-Object { Write-Host "::error title=Unit test::$_" }
+            exit 1
+          }
+
+      - name: Installer test (install, then install again over it)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Check($ok, $what) {
+            if ($ok) { "- [x] $what" >> $env:GITHUB_STEP_SUMMARY; return }
+            "- [ ] **$what**" >> $env:GITHUB_STEP_SUMMARY
+            $tail = ''
+            if (Test-Path setup-install.log) { $tail = (Get-Content setup-install.log -Tail 25) -join '%0A' }
+            Write-Host "::error title=Installer test::$what%0A$tail"; exit 1
+          }
+          "### Installer test" >> $env:GITHUB_STEP_SUMMARY
+          $setup = (Resolve-Path dist\TunnelPulse-Setup.exe).Path
+          Check (-not (Test-Path "$env:ProgramFiles\WireGuard\wireguard.exe")) "WireGuard not installed beforehand (so the installer has to set it up)"
+
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$PWD\setup-install.log" -Wait -PassThru
+          Check ($p.ExitCode -eq 0) "setup exited with code 0 (got $($p.ExitCode))"
+          $log = Get-Content setup-install.log -Raw
+          $sig = ($log -split "`r?`n" | Where-Object { $_ -match 'WireGuard MSI' }) -join '; '
+          "  - $sig" >> $env:GITHUB_STEP_SUMMARY
+          if ($sig) { Write-Host "::notice title=WireGuard download::$sig" }
+          Check ($log -match 'WireGuard installed successfully') "installer downloaded, verified and installed WireGuard"
+          Check (Test-Path "$env:ProgramFiles\TunnelPulse\TunnelPulse.exe") "TunnelPulse.exe installed in Program Files"
+          Check (Test-Path "$env:ProgramFiles\WireGuard\wireguard.exe") "wireguard.exe present"
+          Check (Test-Path "$env:ProgramFiles\WireGuard\wg.exe") "wg.exe present"
+          Check (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\TunnelPulse.lnk") "Start Menu shortcut created"
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{EFB08205-1FB4-478F-A190-D84B95FB3C8D}_is1'
+          Check (Test-Path $key) "listed in Settings > Apps"
+
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$PWD\setup-reinstall.log" -Wait -PassThru
+          Check ($p.ExitCode -eq 0) "installing again over an existing install works (code $($p.ExitCode))"
+          Check (-not ((Get-Content setup-reinstall.log -Raw) -match 'WireGuard MSI:')) "second install skips WireGuard (already there)"
+
+      - name: App launch test
+        run: |
+          "### App launch test" >> $env:GITHUB_STEP_SUMMARY
+          $logFile = "$env:LOCALAPPDATA\TunnelPulse\logs\tunnelpulse.log"
+          Remove-Item $logFile -ErrorAction SilentlyContinue
+          $p = Start-Process "$env:ProgramFiles\TunnelPulse\TunnelPulse.exe" -PassThru
+          Start-Sleep -Seconds 20
+          $alive = -not $p.HasExited
+          $log = if (Test-Path $logFile) { Get-Content $logFile -Raw } else { '' }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          $problems = @()
+          if (-not $alive) { $problems += "the app closed by itself (exit code $($p.ExitCode))" }
+          if ($log -notmatch 'TunnelPulse starting') { $problems += 'no start-up line in the log' }
+          if ($log -match 'CRITICAL|Traceback') { $problems += 'errors in the log' }
+          if ($problems) {
+            "- [ ] **$($problems -join '; ')**" >> $env:GITHUB_STEP_SUMMARY
+            "```````n$log`n``````" >> $env:GITHUB_STEP_SUMMARY
+            $tail = (($log -split "`r?`n") | Select-Object -Last 25) -join '%0A'
+            Write-Host "::error title=App launch test::$($problems -join '; ')%0A$tail"; exit 1
+          }
+          "- [x] installed app starts, stays open for 20 s, and logs no errors" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Real tunnel test
+        run: venv\Scripts\python.exe tests\windows_e2e.py
+
+      - name: Uninstall test
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Check($ok, $what) {
+            if ($ok) { "- [x] $what" >> $env:GITHUB_STEP_SUMMARY; return }
+            "- [ ] **$what**" >> $env:GITHUB_STEP_SUMMARY
+            $tail = ''
+            if (Test-Path setup-uninstall.log) { $tail = (Get-Content setup-uninstall.log -Tail 25) -join '%0A' }
+            Write-Host "::error title=Uninstall test::$what%0A$tail"; exit 1
+          }
+          "### Uninstall test" >> $env:GITHUB_STEP_SUMMARY
+          # Leave a TunnelPulse tunnel running, as if the app were connected when uninstalled.
+          $wg = "$env:ProgramFiles\WireGuard\wg.exe"
+          $priv = & $wg genkey
+          $peer = & $wg genkey | & $wg pubkey
+          $conf = Join-Path $env:RUNNER_TEMP 'TunnelPulse-ci000001.conf'
+          Set-Content -Path $conf -Value "[Interface]`nPrivateKey = $priv`nAddress = 10.98.0.2/32`n`n[Peer]`nPublicKey = $peer`nAllowedIPs = 10.98.0.1/32`nEndpoint = 127.0.0.1:51998`n"
+          Start-Process "$env:ProgramFiles\WireGuard\wireguard.exe" -ArgumentList '/installtunnelservice', $conf -Wait
+          Start-Sleep -Seconds 3
+          $service = 'WireGuardTunnel$TunnelPulse-ci000001'
+          Check ($null -ne (Get-Service -Name $service -ErrorAction SilentlyContinue)) "test tunnel running before uninstall"
+
+          $p = Start-Process "$env:ProgramFiles\TunnelPulse\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$PWD\setup-uninstall.log" -Wait -PassThru
+          for ($i = 0; $i -lt 60 -and (Test-Path "$env:ProgramFiles\TunnelPulse\TunnelPulse.exe"); $i++) { Start-Sleep -Seconds 1 }
+          Check (-not (Test-Path "$env:ProgramFiles\TunnelPulse\TunnelPulse.exe")) "app files removed"
+          Check ($null -eq (Get-Service -Name $service -ErrorAction SilentlyContinue)) "uninstaller removed the running TunnelPulse tunnel"
+          Check (-not (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{EFB08205-1FB4-478F-A190-D84B95FB3C8D}_is1')) "removed from Settings > Apps"
+          Check (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\TunnelPulse.lnk")) "Start Menu shortcut removed"
+          Check (Test-Path "$env:ProgramFiles\WireGuard\wireguard.exe") "WireGuard left installed (it's a separate app)"
+          Check (Test-Path "$env:LOCALAPPDATA\TunnelPulse") "silent uninstall keeps the user's profiles"
+
+      - name: Keep build files and logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: TunnelPulse-build-${{ github.sha }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            dist/TunnelPulse-Setup.exe
+            dist/TunnelPulse-Portable.zip
+            setup-*.log
+            TunnelPulse-BuildLog-*.txt
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Get-FileHash dist\TunnelPulse-Setup.exe, dist\TunnelPulse-Portable.zip -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content dist\SHA256SUMS.txt -Encoding ascii
+          gh release create $env:GITHUB_REF_NAME `
+            dist\TunnelPulse-Setup.exe dist\TunnelPulse-Portable.zip dist\SHA256SUMS.txt `
+            --title "TunnelPulse $env:GITHUB_REF_NAME" --notes-file .github\release-notes.md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

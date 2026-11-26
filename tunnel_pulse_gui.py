@@ -196,10 +196,35 @@ class TunnelPulseApp(ctk.CTk):
         self._build_ui()
         self._refresh_profile_list()
         self._run_startup_check()
+        self._apply_window_icon()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(self.POLL_INTERVAL_MS, self._poll_events)
         self.after(1000, self._tick_uptime)
+
+    def _apply_window_icon(self) -> None:
+        icon = core.resource_dir() / "assets" / "icon.ico"
+        if not icon.exists():
+            return
+        # CustomTkinter sets its own icon about 200 ms after start-up, so set ours after that.
+        self.after(300, lambda: self._safe_iconbitmap(str(icon)))
+
+    def _safe_iconbitmap(self, path: str) -> None:
+        try:
+            self.iconbitmap(path)
+        except Exception as exc:  # noqa: BLE001 - cosmetic only
+            core.log.debug("window icon not applied: %s", exc)
+
+    def auto_connect(self, profile_id: str) -> None:
+        """Used after relaunching with admin rights: pick the profile the user
+        was connecting to and carry on, so they don't have to click again."""
+        for name, profile in self._profiles_by_name.items():
+            if profile.profile_id == profile_id:
+                self.profile_menu.set(name)
+                self.issue_log.add(f"Running as administrator — connecting to '{name}'.")
+                self._on_connect_clicked()
+                return
+        self.issue_log.add("Couldn't find the profile to connect to after elevation.", "warning")
 
     # ---- UI construction ----
 
@@ -295,7 +320,7 @@ class TunnelPulseApp(ctk.CTk):
         self.admin_badge = ctk.CTkLabel(footer, text="", text_color=Theme.TEXT_SECONDARY,
                                          font=ctk.CTkFont(size=11))
         self.admin_badge.pack(side="left")
-        ctk.CTkLabel(footer, text="Prepared by Zain Raza  \u00B7  v1.0.0",
+        ctk.CTkLabel(footer, text=f"Prepared by Zain Raza  \u00B7  v{core.APP_VERSION}",
                      text_color=Theme.TEXT_SECONDARY, font=ctk.CTkFont(size=11)).pack(side="right")
 
         self.admin_badge.configure(
@@ -305,13 +330,26 @@ class TunnelPulseApp(ctk.CTk):
     # ---- startup checks ----
 
     def _run_startup_check(self) -> None:
-        issues = self.engine.locator
-        if issues.wireguard_exe is None:
+        if self.engine.locator.wireguard_exe is None:
             self._show_banner(
-                "WireGuard component not found. Install WireGuard for Windows once, "
-                "or place wireguard.exe + wintun.dll in this app's bin/ folder, then restart.",
+                "WireGuard isn't installed. Run TunnelPulse-Setup again, or get it from "
+                "wireguard.com/install, then restart TunnelPulse.",
                 Theme.WARNING,
             )
+            return
+
+        leftover = self.engine.controller.running_tunnel_ids()
+        if leftover:
+            for name, profile in self._profiles_by_name.items():
+                if profile.profile_id in leftover:
+                    self.profile_menu.set(name)
+                    break
+            self._show_banner(
+                "A tunnel from your last session is still running. Click Connect to take it "
+                "back over (it gets replaced cleanly).",
+                Theme.WARNING,
+            )
+            self.issue_log.add("Found a TunnelPulse tunnel left running from an earlier session.", "warning")
         elif not self.engine.config_store.list_profiles():
             self._show_banner(
                 "No VPN profile yet. Click \u2018Import .conf\u2019 to add one from your server.",
@@ -345,14 +383,23 @@ class TunnelPulseApp(ctk.CTk):
     def _selected_profile(self) -> Optional[core.TunnelProfile]:
         return self._profiles_by_name.get(self.profile_menu.get())
 
+    def _unique_profile_name(self, base: str) -> str:
+        # Providers often name every file wg0.conf; profiles are listed by name,
+        # so a duplicate would hide the earlier one.
+        name, n = base, 2
+        while name in self._profiles_by_name:
+            name, n = f"{base} ({n})", n + 1
+        return name
+
     def _on_import_clicked(self) -> None:
         path = filedialog.askopenfilename(title="Import WireGuard .conf",
                                            filetypes=[("WireGuard config", "*.conf"), ("All files", "*.*")])
         if not path:
             return
         try:
-            text = Path(path).read_text(encoding="utf-8")
-            name = Path(path).stem
+            # utf-8-sig also accepts files saved by Notepad with a byte-order mark.
+            text = Path(path).read_text(encoding="utf-8-sig")
+            name = self._unique_profile_name(Path(path).stem)
             self.engine.config_store.import_wg_conf(text, name=name)
             self._refresh_profile_list()
             self.profile_menu.set(name)
@@ -388,26 +435,28 @@ class TunnelPulseApp(ctk.CTk):
         self.connect_btn.configure(text="Connect", fg_color=Theme.ACCENT)
 
         if isinstance(error, core.PrivilegeError):
-            self._offer_elevation()
+            profile = self._selected_profile()
+            self._offer_elevation(profile.profile_id if profile else None)
             return
 
         msg = error.user_message if isinstance(error, core.TunnelPulseError) else str(error)
         self.issue_log.add(msg, severity="critical")
         messagebox.showerror("Connection failed", msg)
 
-    def _offer_elevation(self) -> None:
+    def _offer_elevation(self, profile_id: Optional[str]) -> None:
         """Missing admin rights is the one connect error the app can fix
-        itself: offer to relaunch elevated."""
+        itself: offer to relaunch elevated and carry on connecting."""
         want_elevate = messagebox.askyesno(
             "Administrator rights needed",
-            "Starting a tunnel installs a network adapter and firewall rules, "
-            "which needs administrator rights.\n\nRelaunch TunnelPulse as administrator now?",
+            "Connecting installs a WireGuard tunnel service, which needs "
+            "administrator rights.\n\nReopen TunnelPulse as administrator and connect now?",
         )
         if not want_elevate:
             self.issue_log.add("Admin rights declined — connect again when ready.", "warning")
             return
         try:
-            if core.PrivilegeManager.relaunch_as_admin():
+            extra = ["--connect", profile_id] if profile_id else []
+            if core.PrivilegeManager.relaunch_as_admin(extra):
                 # A new elevated process is starting up; this one's done.
                 self.engine.shutdown()
                 self.destroy()
@@ -563,6 +612,7 @@ def _install_global_exception_guard(app: TunnelPulseApp, log) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(prog="TunnelPulse")
     parser.add_argument("--debug", action="store_true", help="verbose logging + console output")
+    parser.add_argument("--connect", metavar="PROFILE_ID", help="connect to this profile once the window opens")
     args = parser.parse_args()
 
     log = core.configure_logging(debug=args.debug)
@@ -582,6 +632,8 @@ def main() -> int:
         return 1
 
     _install_global_exception_guard(app, log)
+    if args.connect:
+        app.after(800, lambda: app.auto_connect(args.connect))
 
     try:
         app.mainloop()

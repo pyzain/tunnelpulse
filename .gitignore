@@ -26,3 +26,7 @@ bin/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Test output
+.pytest_cache/
+setup-*.log
