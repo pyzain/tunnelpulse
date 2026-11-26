@@ -46,8 +46,15 @@ for you.
 
 ## Connect for the first time
 
-1. You need a **`.conf` file** for your VPN server (see
-   [You need a server](#you-need-a-server) below).
+1. You need a **`.conf` file**: a small text file with a VPN server's address
+   and your keys. Don't have one? Get one free from Proton VPN:
+   - Make a free account at [account.protonvpn.com](https://account.protonvpn.com/).
+   - Go to **Downloads**, then **WireGuard configuration**.
+   - Type any name (for example `TunnelPulse`), choose **Windows**, then click
+     the first **Create** button (the "best server" one) and **Download**.
+
+   Other options are in [You need a server](#you-need-a-server) below.
+   Keep your `.conf` file private: it works like a password.
 2. Open TunnelPulse and click **Import .conf**. Pick your file.
 3. Click **Connect**. The first time, Windows asks for administrator rights
    (connecting installs a network adapter); click **Yes**. TunnelPulse reopens
