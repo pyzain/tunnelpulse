@@ -59,24 +59,47 @@ function Log($Msg, $Color = "Cyan") {
 
 function Find-InnoSetup {
     # Returns @{ Path; Version } for an Inno Setup compiler new enough for the
-    # dark wizard style (6.6+), or $null.
-    $candidates = @(
-        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    # dark wizard style (6.6+), or $null. $script:InnoSeen lists what was found,
+    # for the error message.
+    $candidates = @()
+    if ($env:TUNNELPULSE_ISCC) { $candidates += $env:TUNNELPULSE_ISCC }
+    # Where Windows says Inno Setup is installed (machine-wide or per-user).
+    $uninstallKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup *_is1"
     )
+    foreach ($k in $uninstallKeys) {
+        Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.InstallLocation) { $candidates += (Join-Path $_.InstallLocation "ISCC.exe") }
+        }
+    }
+    # Usual folders, for any major version.
+    foreach ($root in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, "$env:LOCALAPPDATA\Programs")) {
+        if ($root) {
+            $candidates += Get-ChildItem -Path $root -Filter "Inno Setup *" -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName "ISCC.exe" }
+        }
+    }
+    # Last: whatever is on PATH. Chocolatey puts a small launcher ("shim") there
+    # whose version number isn't Inno Setup's, so shims are skipped.
     $onPath = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-    if ($onPath) { $candidates = @($onPath.Source) + $candidates }
-    foreach ($c in $candidates) {
+    if ($onPath -and $onPath.Source -notmatch '\\chocolatey\\bin\\') { $candidates += $onPath.Source }
+
+    $script:InnoSeen = @()
+    $best = $null
+    foreach ($c in ($candidates | Select-Object -Unique)) {
         if (-not $c -or -not (Test-Path $c)) { continue }
+        $v = $null
         try {
             $info = (Get-Item $c).VersionInfo
-            $v = [version]("$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)")
-        } catch { continue }
-        if ($v -ge [version]"6.6.0") { return @{ Path = $c; Version = $v } }
-        Log "  Found Inno Setup $v at $c, but 6.6 or newer is needed" "Yellow"
+            if ($info.ProductVersion -match '^(\d+)\.(\d+)\.(\d+)') { $v = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" }
+            elseif ($info.FileMajorPart) { $v = [version]"$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)" }
+        } catch { }
+        $script:InnoSeen += "$c (version $v)"
+        if ($v -and $v -ge [version]"6.6.0" -and (-not $best -or $v -gt $best.Version)) { $best = @{ Path = $c; Version = $v } }
     }
-    return $null
+    return $best
 }
 
 function Invoke-Tool([string]$Exe, [string[]]$ToolArgs) {
@@ -421,7 +444,8 @@ print(struct.calcsize("P") * 8)
         if (-not (Test-Path $setupExe)) { Fail "Installer not found: $setupExe" }
         Log "  Installer: $setupExe" "Green"
     } elseif ($NonInteractive) {
-        Fail "Inno Setup 6.6 or newer is required to build the installer."
+        $seen = if ($script:InnoSeen) { $script:InnoSeen -join "; " } else { "no ISCC.exe found" }
+        Fail "Inno Setup 6.6 or newer is required to build the installer. Found: $seen"
     } else {
         Log "  Skipped: Inno Setup 6.6+ isn't installed. Install it from https://jrsoftware.org/isdl.php" "Yellow"
         Log "  (or run: winget install JRSoftware.InnoSetup), then build again." "Yellow"

@@ -49,6 +49,10 @@ jobs:
         run: |
           choco upgrade innosetup -y --no-progress
           if ($LASTEXITCODE -ne 0) { Write-Host "::error title=Inno Setup::choco upgrade innosetup failed ($LASTEXITCODE)"; exit 1 }
+          $found = Get-ChildItem -Path "${env:ProgramFiles(x86)}", "$env:ProgramFiles", "$env:LOCALAPPDATA\Programs" -Filter "Inno Setup *" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-Item (Join-Path $_.FullName "ISCC.exe") -ErrorAction SilentlyContinue }
+          foreach ($f in $found) { Write-Host "::notice title=Inno Setup found::$($f.FullName) $($f.VersionInfo.ProductVersion)" }
+          if ($found) { "TUNNELPULSE_ISCC=$(($found | Select-Object -Last 1).FullName)" >> $env:GITHUB_ENV }
 
       - name: Build app, portable zip and installer
         run: |
